@@ -12,5 +12,6 @@
     }
   ],
   "queue": { "maxWaitMs": 900000 },
-  "timers": { "maxActive": 20, "minIntervalSec": 10 }
+  "timers": { "maxActive": 20, "minIntervalSec": 10 },
+  "control": { "port": 4180, "token": "" }
 }

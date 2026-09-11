@@ -4,9 +4,14 @@ import type { KiloClient } from "@kilocode/sdk"
 import { FeishuBot, type InboundMessage } from "./feishu.ts"
 import { SessionQueue } from "./queue.ts"
 import { TimerStore } from "./timer.ts"
+import { startControl, type ControlServer } from "./control.ts"
 import { log, warn } from "./log.ts"
 import { saveState } from "./state.ts"
-import type { Config, State, Trust } from "./types.ts"
+import { mkdirSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import { randomBytes } from "node:crypto"
+import type { Config, State, Trust, TimerRecord } from "./types.ts"
 
 interface Inbound extends InboundMessage {
   trust: Trust
@@ -25,6 +30,7 @@ interface Runtime {
   busy: boolean
   queue: SessionQueue<Inbound>
   inflight?: Inflight
+  lastChatId?: string
 }
 
 export class Bridge {
@@ -38,6 +44,7 @@ export class Bridge {
   private readonly state: State
   private readonly stateFile: string
   private readonly creds: Map<string, FeishuCreds>
+  private control?: ControlServer
 
   constructor(cfg: Config, state: State, stateFile: string, creds: Map<string, FeishuCreds>) {
     this.cfg = cfg
@@ -70,6 +77,50 @@ export class Bridge {
     return this.timers.cancel(id)
   }
 
+  private ensureToken(): string {
+    const t = this.cfg.control?.token || this.state.controlToken || randomBytes(24).toString("hex")
+    if (this.state.controlToken !== t) {
+      this.state.controlToken = t
+      saveState(this.stateFile, this.state)
+    }
+    return t
+  }
+
+  private originFor(sessionID: string): string {
+    const rt = sessionID ? this.runtimes.get(sessionID) : undefined
+    if (rt?.lastChatId) return `feishu|${rt.name}|${rt.lastChatId}`
+    if (rt) return `session|${rt.directory}|${sessionID}`
+    return "window"
+  }
+
+  private setTimerFromSession(body: Record<string, unknown>): TimerRecord {
+    const title = String(body.title ?? "").trim()
+    if (!title) throw new Error("title required")
+    const delaySec = body.delaySec != null ? Number(body.delaySec) : undefined
+    const at = body.at != null ? String(body.at) : undefined
+    const fireAt =
+      body.fireAt != null
+        ? Number(body.fireAt)
+        : at
+          ? Date.parse(at)
+          : delaySec != null
+            ? Date.now() + delaySec * 1000
+            : NaN
+    if (!Number.isFinite(fireAt)) throw new Error("need one of: delaySec, at (ISO), fireAt (epoch ms)")
+    return this.timers.set({
+      fireAt,
+      title,
+      notes: body.notes != null ? String(body.notes) : undefined,
+      origin: this.originFor(String(body.sessionID ?? "")),
+    })
+  }
+
+  private writeControlFile(port: number, token: string): void {
+    const dir = join(homedir(), ".local", "state", "kilo-resident")
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, "control.json"), JSON.stringify({ url: `http://127.0.0.1:${port}`, token, pid: process.pid }, null, 2))
+  }
+
   async start(): Promise<void> {
     for (const bot of this.cfg.bots) {
       const creds = this.creds.get(bot.name)
@@ -92,6 +143,16 @@ export class Bridge {
     const dirs = new Set([...this.byBot.values()].map((r) => r.directory))
     for (const dir of dirs) void this.subscribeEvents(dir)
     this.timers.start()
+
+    const port = this.cfg.control?.port ?? 4180
+    const token = this.ensureToken()
+    this.control = startControl(port, token, {
+      list: () => this.timers.list(),
+      set: (body) => this.setTimerFromSession(body),
+      cancel: (id) => this.timers.cancel(id),
+    })
+    this.writeControlFile(port, token)
+
     log("bridge", `ready (${this.byBot.size} bot(s), ${dirs.size} dir(s))`)
   }
 
@@ -130,6 +191,7 @@ export class Bridge {
       log("bridge", `drop denied sender ${acc.name ?? acc.user_id ?? acc.open_id}`)
       return
     }
+    rt.lastChatId = msg.chatId
     if (!msg.text.trim()) {
       log("bridge", "ignore empty or non-text message")
       return
@@ -191,9 +253,23 @@ export class Bridge {
           await reply(t ? `已取消 ${t.id}` : `未找到待触发的 timer ${arg}`)
           break
         }
+        case "timer": {
+          const m = arg.match(/^(\d+(?:\.\d+)?)\s+(.+)$/)
+          if (!m) {
+            await reply("用法: /timer <分钟后> <标题>")
+            break
+          }
+          const t = this.timers.set({
+            fireAt: Date.now() + Number(m[1]) * 60_000,
+            title: m[2],
+            origin: `feishu|${rt.name}|${msg.chatId}`,
+          })
+          await reply(`已设 timer ${t.id}\n${new Date(t.fireAt).toLocaleString()}  ${t.title}`)
+          break
+        }
         case "help":
         default:
-          await reply("命令:\n/new 新会话\n/compact 压缩上下文\n/timers 列 timer\n/cancel <id> 取消 timer\n/help 帮助")
+          await reply("命令:\n/new 新会话\n/compact 压缩上下文\n/timers 列 timer\n/timer <分钟后> <标题> 设 timer\n/cancel <id> 取消 timer\n/help 帮助")
           break
       }
     } catch (err) {
@@ -300,19 +376,26 @@ export class Bridge {
 
   // ---------- timers ----------
 
-  private onTimerFire(t: { id: string; fireAt: number; title: string; notes?: string; origin: string }, missed: boolean): void {
+  private onTimerFire(t: TimerRecord, missed: boolean): void {
     const note = missed ? `\n(delayed; was due ${new Date(t.fireAt).toLocaleString()})` : ""
     const text = `[timer] ${t.title}${t.notes ? "\n" + t.notes : ""}${note}`
-    const [kind, botName, chatId] = t.origin.split(":")
-    const rt = botName ? this.byBot.get(botName) : undefined
-    if (kind === "feishu" && rt && chatId) {
-      void rt.feishu.sendText(chatId, text)
-    } else {
-      log("timer", `fired without a delivery channel: ${text}`)
+    const wake = `[timer ${t.id}] ${t.title}${t.notes ? " — " + t.notes : ""}${missed ? " (missed, delivered late)" : ""}`
+    const [kind, a, b] = t.origin.split("|")
+
+    if (kind === "feishu") {
+      const rt = this.byBot.get(a)
+      if (rt && b) void rt.feishu.sendText(b, text)
+      else log("timer", `fired but bot ${a} not found: ${text}`)
+      if (rt && !rt.busy) {
+        void promptAsync(this.client, rt.sessionId, rt.directory, this.model(), `msg_timer_${t.id}`, wake).catch(() => {})
+      }
+      return
     }
-    if (rt && !rt.busy) {
-      const wake = `[timer ${t.id}] ${t.title}${t.notes ? " — " + t.notes : ""}${missed ? " (missed, delivered late)" : ""}`
-      void promptAsync(this.client, rt.sessionId, rt.directory, this.model(), `msg_timer_${t.id}`, wake).catch(() => {})
+    if (kind === "session") {
+      void promptAsync(this.client, b, a, this.model(), `msg_timer_${t.id}`, wake).catch(() => {})
+      log("timer", `woke session ${b}: ${text}`)
+      return
     }
+    log("timer", `fired without a delivery channel: ${text}`)
   }
 }

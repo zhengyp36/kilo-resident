@@ -14,6 +14,7 @@
     "test:roundtrip": "node test/roundtrip.ts"
   },
   "dependencies": {
+    "@kilocode/plugin": "^7.3.21",
     "@kilocode/sdk": "7.3.21",
     "@larksuiteoapi/node-sdk": "1.73.3"
   },

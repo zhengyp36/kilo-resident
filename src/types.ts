@@ -23,6 +23,7 @@ export interface Config {
   bots: BotConfig[]
   queue?: { maxWaitMs?: number }
   timers?: { maxActive?: number; minIntervalSec?: number }
+  control?: { port?: number; token?: string }
 }
 
 export interface TimerRecord {
@@ -40,4 +41,5 @@ export interface TimerRecord {
 export interface State {
   sessions: Record<string, string>
   timers: TimerRecord[]
+  controlToken?: string
 }
