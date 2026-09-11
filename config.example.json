@@ -1,0 +1,16 @@
+{
+  "model": { "providerID": "deepseek", "modelID": "deepseek-v4-flash" },
+  "daemon": { "url": "", "username": "", "password": "" },
+  "accounts": [
+    { "user_id": "<feishu-user-id>", "name": "YZ", "trust": "superuser" }
+  ],
+  "bots": [
+    {
+      "name": "KILO-LOCUS-A",
+      "directory": "/home/zhengyp/work/B/locus",
+      "session": ""
+    }
+  ],
+  "queue": { "maxWaitMs": 900000 },
+  "timers": { "maxActive": 20, "minIntervalSec": 10 }
+}

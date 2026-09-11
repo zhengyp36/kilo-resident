@@ -1,0 +1,24 @@
+{
+  "name": "kilo-resident",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Resident Kilo bridge: Feishu <-> window dual channel over `kilo daemon`.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "dev": "node --watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test:roundtrip": "node test/roundtrip.ts"
+  },
+  "dependencies": {
+    "@kilocode/sdk": "7.3.21",
+    "@larksuiteoapi/node-sdk": "1.73.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  }
+}
