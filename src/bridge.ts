@@ -1,5 +1,5 @@
 import { matchAccount, loadDaemon, type FeishuCreds } from "./config.ts"
-import { makeKiloClient, createSession, listSessionIds, getMessages, promptAsync, summarize, type Model } from "./kilo.ts"
+import { makeKiloClient, createSession, listSessionIds, listSessions, getMessages, promptAsync, summarize, type Model, type SessionInfo } from "./kilo.ts"
 import { createKiloClient, type KiloClient } from "@kilocode/sdk"
 import { FeishuBot, type InboundMessage } from "./feishu.ts"
 import { SessionQueue } from "./queue.ts"
@@ -22,6 +22,7 @@ interface Inbound extends InboundMessage {
 interface Inflight {
   injectedId: string
   chatId: string
+  since: number
 }
 
 interface PendingPermission {
@@ -46,6 +47,18 @@ interface Runtime {
   wakes: { messageID: string; text: string; serverUrl?: string; chatId?: string }[]
   inflight?: Inflight
   lastChatId?: string
+  /** Snapshot from the last /sessions listing, so /pin <n> resolves to a stable id. */
+  lastSessions?: SessionInfo[]
+  /** Set while becameIdle is resolving/awaiting a reply, to avoid concurrent duplicate sends. */
+  resolving?: boolean
+}
+
+function timeAgo(ms: number): string {
+  const diff = Date.now() - ms
+  if (diff < 60_000) return "刚刚"
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}分前`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}小时前`
+  return new Date(ms).toLocaleDateString()
 }
 
 export class Bridge {
@@ -225,6 +238,21 @@ export class Bridge {
 
   // ---------- inbound ----------
 
+  /** Point a runtime at a session id (used by /new and /pin). Returns the previous id. */
+  private switchSession(rt: Runtime, id: string): string {
+    const old = rt.sessionId
+    if (old !== id) this.runtimes.delete(old)
+    this.state.sessions[rt.name] = id
+    saveState(this.stateFile, this.state)
+    rt.sessionId = id
+    rt.inflight = undefined
+    rt.busy = false
+    rt.queue.clear()
+    rt.wakes = []
+    this.runtimes.set(id, rt)
+    return old
+  }
+
   private onInbound(botName: string, msg: InboundMessage): void {
     const rt = this.byBot.get(botName)
     if (!rt) return
@@ -262,18 +290,57 @@ export class Bridge {
     try {
       switch (cmd) {
         case "new": {
-          const old = rt.sessionId
           const id = await createSession(this.client, rt.directory, "resident")
-          this.state.sessions[rt.name] = id
-          saveState(this.stateFile, this.state)
-          this.runtimes.delete(old)
-          rt.sessionId = id
-          rt.inflight = undefined
-          rt.busy = false
-          rt.queue.clear()
-          rt.wakes = []
-          this.runtimes.set(id, rt)
+          const old = this.switchSession(rt, id)
           await reply(`已开新会话 ${id}\n(旧 ${old})`)
+          break
+        }
+        case "sessions": {
+          const list = await listSessions(this.client, rt.directory)
+          list.sort((a, b) => b.updated - a.updated)
+          const shown = list.slice(0, 30)
+          rt.lastSessions = shown
+          if (shown.length === 0) {
+            await reply("没有会话")
+            break
+          }
+          const lines = shown.map(
+            (s, i) => `${s.id === rt.sessionId ? ">" : " "} ${i + 1}. ${s.title || "(untitled)"}  ${s.id}  ${timeAgo(s.updated)}`,
+          )
+          const more = list.length > shown.length ? `\n(共 ${list.length} 个，仅显示最近 ${shown.length} 个)` : ""
+          await reply(`会话（/pin <编号> 切换）:\n${lines.join("\n")}${more}`)
+          break
+        }
+        case "pin": {
+          if (!arg) {
+            await reply("用法: /pin <编号|session id>\n先发 /sessions 获取编号")
+            break
+          }
+          let target: string | undefined
+          if (/^\d+$/.test(arg)) {
+            if (!rt.lastSessions) {
+              await reply("先发 /sessions 获取编号")
+              break
+            }
+            target = rt.lastSessions[Number(arg) - 1]?.id
+            if (!target) {
+              await reply(`编号 ${arg} 超出范围，重新发 /sessions`)
+              break
+            }
+          } else {
+            target = arg
+          }
+          if (target === rt.sessionId) {
+            await reply(`已在会话 ${target}`)
+            break
+          }
+          const ids = await listSessionIds(this.client, rt.directory)
+          if (!ids.includes(target)) {
+            await reply(`未找到会话 ${target}`)
+            break
+          }
+          const old = this.switchSession(rt, target)
+          await reply(`已切换会话\n${target}\n(旧 ${old})`)
           break
         }
         case "compact":
@@ -350,7 +417,7 @@ export class Bridge {
         case "help":
         default:
           await reply(
-            "命令:\n/new 新会话\n/compact 压缩上下文\n/timers 列 timer\n/timer <分钟后> <标题> 设 timer\n/cancel <id> 取消 timer\n/pending 列待审批\n/allow <id> 放行审批\n/deny <id> 拒绝审批\n/help 帮助",
+            "命令:\n/new 新会话\n/sessions 列会话\n/pin <编号> 切换会话\n/compact 压缩上下文\n/timers 列 timer\n/timer <分钟后> <标题> 设 timer\n/cancel <id> 取消 timer\n/pending 列待审批\n/allow <id> 放行审批\n/deny <id> 拒绝审批\n/help 帮助",
           )
           break
       }
@@ -372,7 +439,7 @@ export class Bridge {
 
   private async inject(rt: Runtime, item: Inbound): Promise<void> {
     const injectedId = `msg_feishu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
-    rt.inflight = { injectedId, chatId: item.chatId }
+    rt.inflight = { injectedId, chatId: item.chatId, since: Date.now() }
     rt.busy = true
     try {
       const actualId = await this.deliver(rt.sessionId, rt.directory, injectedId, item.text)
@@ -425,40 +492,62 @@ export class Bridge {
 
   private async becameIdle(sessionId: string): Promise<void> {
     const rt = this.runtimes.get(sessionId)
-    if (!rt) return
+    if (!rt || rt.resolving) return
     if (!rt.busy && !rt.inflight) return
-    rt.busy = false
-    const inflight = rt.inflight
-    rt.inflight = undefined
-    if (inflight) await this.resolveReply(rt, inflight)
-    rt.queue.dropExpired()
-    const next = rt.queue.shift()
-    if (next) {
-      await this.inject(rt, next)
-      return
+    rt.resolving = true
+    try {
+      if (rt.inflight) {
+        const settled = await this.resolveReply(rt, rt.inflight)
+        if (!settled && Date.now() - rt.inflight.since < 600_000) return // turn still generating; wait for the next idle
+        if (!settled) warn("bridge", `giving up on reply for ${rt.inflight.injectedId} after 10min`)
+        rt.inflight = undefined
+      }
+      rt.busy = false
+      rt.queue.dropExpired()
+      const next = rt.queue.shift()
+      if (next) {
+        await this.inject(rt, next)
+        return
+      }
+      const wake = rt.wakes.shift()
+      if (wake) await this.deliverWake(rt, wake.messageID, wake.text, wake.serverUrl, wake.chatId)
+    } finally {
+      rt.resolving = false
     }
-    const wake = rt.wakes.shift()
-    if (wake) await this.deliverWake(rt, wake.messageID, wake.text, wake.serverUrl, wake.chatId)
   }
 
-  private async resolveReply(rt: Runtime, inflight: Inflight): Promise<void> {
-    try {
-      const msgs = await getMessages(this.client, rt.sessionId, rt.directory)
-      const replies = msgs.filter((m) => m.info.role === "assistant" && m.info.parentID === inflight.injectedId)
-      const texts: string[] = []
-      const files: string[] = []
-      for (const m of replies) {
-        for (const p of m.parts) {
-          if (p.type === "text" && !p.synthetic && p.text.trim()) texts.push(p.text.trim())
-          if (p.type === "file" && p.url) files.push(p.url)
+  /**
+   * Send the assistant reply for an injected turn. Returns true once the turn is settled (reply sent,
+   * or nothing to send). Returns false when the reply is not ready yet — an idle can fire before the
+   * assistant message finishes streaming, so callers keep the inflight and retry on the next idle.
+   */
+  private async resolveReply(rt: Runtime, inflight: Inflight): Promise<boolean> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const msgs = await getMessages(this.client, rt.sessionId, rt.directory)
+        const replies = msgs.filter((m) => m.info.role === "assistant" && m.info.parentID === inflight.injectedId)
+        const last = replies[replies.length - 1]
+        const finished = last != null && ((last.info as { time?: { completed?: number } }).time?.completed ?? 0) > 0
+        if (finished) {
+          const texts: string[] = []
+          const files: string[] = []
+          for (const m of replies) {
+            for (const p of m.parts) {
+              if (p.type === "text" && !p.synthetic && p.text.trim()) texts.push(p.text.trim())
+              if (p.type === "file" && p.url) files.push(p.url)
+            }
+          }
+          const body = texts.join("\n\n").trim()
+          if (body) await rt.feishu.sendText(inflight.chatId, body)
+          for (const url of files) await this.sendFilePart(rt, inflight.chatId, url)
+          log("bridge", `reply -> chat=${inflight.chatId} chars=${body.length} files=${files.length}`)
+          return true
         }
+      } catch (err) {
+        warn("bridge", `resolveReply read failed: ${String(err)}`)
       }
-      const body = texts.join("\n\n").trim()
-      if (body) await rt.feishu.sendText(inflight.chatId, body)
-      for (const url of files) await this.sendFilePart(rt, inflight.chatId, url)
-      log("bridge", `reply -> chat=${inflight.chatId} chars=${body.length} files=${files.length}`)
-    } catch (err) {
-      warn("bridge", `resolveReply failed: ${String(err)}`)
+      if (attempt >= 4) return false
+      await new Promise((r) => setTimeout(r, 250))
     }
   }
 
@@ -637,7 +726,7 @@ export class Bridge {
 
   private async deliverWake(rt: Runtime, messageID: string, text: string, serverUrl?: string, chatId?: string): Promise<void> {
     rt.busy = true
-    if (chatId) rt.inflight = { injectedId: messageID, chatId }
+    if (chatId) rt.inflight = { injectedId: messageID, chatId, since: Date.now() }
     try {
       const actualId = await this.deliver(rt.sessionId, rt.directory, messageID, text, serverUrl)
       if (rt.inflight) rt.inflight.injectedId = actualId

@@ -22,6 +22,13 @@ export async function listSessionIds(client: KiloClient, directory: string): Pro
   return (r.data ?? []).map((s) => s.id)
 }
 
+export type SessionInfo = { id: string; title: string; created: number; updated: number }
+
+export async function listSessions(client: KiloClient, directory: string): Promise<SessionInfo[]> {
+  const r = await client.session.list({ query: { directory } })
+  return (r.data ?? []).map((s) => ({ id: s.id, title: s.title, created: s.time.created, updated: s.time.updated }))
+}
+
 export async function getMessages(client: KiloClient, sessionId: string, directory: string): Promise<SessionMessage[]> {
   const r = await client.session.messages({ path: { id: sessionId }, query: { directory } })
   return r.data ?? []
