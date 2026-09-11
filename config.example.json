@@ -13,5 +13,16 @@
   ],
   "queue": { "maxWaitMs": 900000 },
   "timers": { "maxActive": 20, "minIntervalSec": 10 },
-  "control": { "port": 4180, "token": "" }
+  "terminal": { "maxOutput": 262144, "defaultObserveLimit": 8192 },
+  "permissions": {
+    "allow": [
+      { "permission": "bash", "pattern": "ls*" },
+      { "permission": "bash", "pattern": "git status*" },
+      { "permission": "bash", "pattern": "git diff*" },
+      { "permission": "bash", "pattern": "git log*" }
+    ],
+    "approvalTimeoutSec": 300
+  },
+  "control": { "port": 4180, "token": "" },
+  "wake": { "mode": "async" }
 }

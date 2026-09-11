@@ -1,9 +1,11 @@
 import { matchAccount, loadDaemon, type FeishuCreds } from "./config.ts"
 import { makeKiloClient, createSession, listSessionIds, getMessages, promptAsync, summarize, type Model } from "./kilo.ts"
-import type { KiloClient } from "@kilocode/sdk"
+import { createKiloClient, type KiloClient } from "@kilocode/sdk"
 import { FeishuBot, type InboundMessage } from "./feishu.ts"
 import { SessionQueue } from "./queue.ts"
 import { TimerStore } from "./timer.ts"
+import { TerminalManager, type TerminalSession } from "./terminal.ts"
+import { matchesAllow } from "./permission.ts"
 import { startControl, type ControlServer } from "./control.ts"
 import { log, warn } from "./log.ts"
 import { saveState } from "./state.ts"
@@ -22,6 +24,18 @@ interface Inflight {
   chatId: string
 }
 
+interface PendingPermission {
+  id: string
+  sessionID: string
+  directory: string
+  permission: string
+  patterns: string[]
+  chatId: string
+  botName: string
+  createdAt: number
+  timer: NodeJS.Timeout
+}
+
 interface Runtime {
   name: string
   directory: string
@@ -29,21 +43,27 @@ interface Runtime {
   feishu: FeishuBot
   busy: boolean
   queue: SessionQueue<Inbound>
+  wakes: { messageID: string; text: string; serverUrl?: string; chatId?: string }[]
   inflight?: Inflight
   lastChatId?: string
 }
 
 export class Bridge {
   private readonly client: KiloClient
+  private readonly daemonUrl: string
+  private readonly wakeClients = new Map<string, KiloClient>()
   private readonly runtimes = new Map<string, Runtime>()
   private readonly byBot = new Map<string, Runtime>()
   private readonly timers: TimerStore
+  private readonly terminals: TerminalManager
   private readonly seenEvents = new Set<string>()
   private readonly seenInbound = new Set<string>()
+  private readonly pendingPermissions = new Map<string, PendingPermission>()
   private readonly cfg: Config
   private readonly state: State
   private readonly stateFile: string
   private readonly creds: Map<string, FeishuCreds>
+  private readonly wakeMode: "async" | "tui"
   private control?: ControlServer
 
   constructor(cfg: Config, state: State, stateFile: string, creds: Map<string, FeishuCreds>) {
@@ -51,17 +71,26 @@ export class Bridge {
     this.state = state
     this.stateFile = stateFile
     this.creds = creds
+    this.wakeMode = cfg.wake?.mode === "tui" ? "tui" : "async"
     const daemon =
       cfg.daemon?.url
         ? { url: cfg.daemon.url, username: cfg.daemon.username, password: cfg.daemon.password }
         : loadDaemon()
     if (!daemon?.url) throw new Error("daemon not found: start `kilo daemon start` or set config.daemon.url")
     this.client = makeKiloClient(daemon)
+    this.daemonUrl = daemon.url
 
     this.timers = new TimerStore(state.timers, (t, missed) => this.onTimerFire(t, missed), {
       maxActive: cfg.timers?.maxActive ?? 20,
       minIntervalSec: cfg.timers?.minIntervalSec ?? 10,
       persist: () => saveState(this.stateFile, this.state),
+    })
+
+    this.terminals = new TerminalManager({
+      defaultCwd: process.cwd(),
+      maxOutput: cfg.terminal?.maxOutput,
+      defaultObserveLimit: cfg.terminal?.defaultObserveLimit,
+      onDone: (s) => this.onTerminalDone(s),
     })
   }
 
@@ -86,10 +115,11 @@ export class Bridge {
     return t
   }
 
-  private originFor(sessionID: string): string {
+  private originFor(sessionID: string, directory?: string): string {
     const rt = sessionID ? this.runtimes.get(sessionID) : undefined
     if (rt?.lastChatId) return `feishu|${rt.name}|${rt.lastChatId}`
     if (rt) return `session|${rt.directory}|${sessionID}`
+    if (sessionID) return `session|${directory ?? ""}|${sessionID}`
     return "window"
   }
 
@@ -111,7 +141,7 @@ export class Bridge {
       fireAt,
       title,
       notes: body.notes != null ? String(body.notes) : undefined,
-      origin: this.originFor(String(body.sessionID ?? "")),
+      origin: this.originFor(String(body.sessionID ?? ""), body.directory != null ? String(body.directory) : undefined),
     })
   }
 
@@ -133,7 +163,7 @@ export class Bridge {
       const queue = new SessionQueue<Inbound>(this.cfg.queue?.maxWaitMs ?? 900_000, (item) => {
         void this.byBot.get(bot.name)?.feishu.sendText(item.chatId, "[busy] dropped an earlier message after waiting too long; please resend.")
       })
-      const rt: Runtime = { name: bot.name, directory: bot.directory, sessionId, feishu, busy: false, queue }
+      const rt: Runtime = { name: bot.name, directory: bot.directory, sessionId, feishu, busy: false, queue, wakes: [] }
       this.runtimes.set(sessionId, rt)
       this.byBot.set(bot.name, rt)
       feishu.start()
@@ -150,6 +180,26 @@ export class Bridge {
       list: () => this.timers.list(),
       set: (body) => this.setTimerFromSession(body),
       cancel: (id) => this.timers.cancel(id),
+      terminal: {
+        open: (b) =>
+          this.terminals.open({
+            cwd: b.cwd != null ? String(b.cwd) : undefined,
+            sessionID: b.sessionID != null ? String(b.sessionID) : undefined,
+            directory: b.directory != null ? String(b.directory) : undefined,
+            serverUrl: b.serverUrl != null ? String(b.serverUrl) : undefined,
+          }),
+        exec: (b) =>
+          this.terminals.exec(b.id, String(b.command ?? ""), {
+            sessionID: b.sessionID != null ? String(b.sessionID) : undefined,
+            directory: b.directory != null ? String(b.directory) : undefined,
+            serverUrl: b.serverUrl != null ? String(b.serverUrl) : undefined,
+          }),
+        observe: (b) =>
+          this.terminals.observe(b.id, b.offset != null ? Number(b.offset) : undefined, b.limit != null ? Number(b.limit) : undefined),
+        cancel: (b) => this.terminals.cancel(b.id),
+        list: () => this.terminals.list(),
+        close: (b) => this.terminals.close(b.id),
+      },
     })
     this.writeControlFile(port, token)
 
@@ -221,6 +271,7 @@ export class Bridge {
           rt.inflight = undefined
           rt.busy = false
           rt.queue.clear()
+          rt.wakes = []
           this.runtimes.set(id, rt)
           await reply(`已开新会话 ${id}\n(旧 ${old})`)
           break
@@ -267,9 +318,40 @@ export class Bridge {
           await reply(`已设 timer ${t.id}\n${new Date(t.fireAt).toLocaleString()}  ${t.title}`)
           break
         }
+        case "allow": {
+          if (!arg) {
+            await reply("用法: /allow <审批 id>")
+            break
+          }
+          await reply(await this.resolvePermission(arg, true))
+          break
+        }
+        case "deny": {
+          if (!arg) {
+            await reply("用法: /deny <审批 id>")
+            break
+          }
+          await reply(await this.resolvePermission(arg, false))
+          break
+        }
+        case "pending": {
+          if (this.pendingPermissions.size === 0) {
+            await reply("没有待审批的权限请求")
+            break
+          }
+          await reply(
+            "待审批:\n" +
+              [...this.pendingPermissions.values()]
+                .map((p) => `${p.id}  ${p.permission}  ${p.patterns.join(", ") || "-"}`)
+                .join("\n"),
+          )
+          break
+        }
         case "help":
         default:
-          await reply("命令:\n/new 新会话\n/compact 压缩上下文\n/timers 列 timer\n/timer <分钟后> <标题> 设 timer\n/cancel <id> 取消 timer\n/help 帮助")
+          await reply(
+            "命令:\n/new 新会话\n/compact 压缩上下文\n/timers 列 timer\n/timer <分钟后> <标题> 设 timer\n/cancel <id> 取消 timer\n/pending 列待审批\n/allow <id> 放行审批\n/deny <id> 拒绝审批\n/help 帮助",
+          )
           break
       }
     } catch (err) {
@@ -293,8 +375,9 @@ export class Bridge {
     rt.inflight = { injectedId, chatId: item.chatId }
     rt.busy = true
     try {
-      await promptAsync(this.client, rt.sessionId, rt.directory, this.model(), injectedId, item.text)
-      log("bridge", `injected ${injectedId} -> ${rt.sessionId}`)
+      const actualId = await this.deliver(rt.sessionId, rt.directory, injectedId, item.text)
+      if (rt.inflight) rt.inflight.injectedId = actualId
+      log("bridge", `injected ${actualId} -> ${rt.sessionId}`)
     } catch (err) {
       warn("bridge", `inject failed: ${String(err)}`)
       rt.busy = false
@@ -308,7 +391,7 @@ export class Bridge {
     for (;;) {
       try {
         const sub = await this.client.event.subscribe({ query: { directory } })
-        for await (const ev of sub.stream) this.onEvent(ev as { id?: string; type: string; properties?: Record<string, unknown> })
+        for await (const ev of sub.stream) this.onEvent(ev as { id?: string; type: string; properties?: Record<string, unknown> }, directory)
       } catch (err) {
         warn("bridge", `event stream[${directory}] ended (${String(err)}); reconnecting in 2s`)
         await new Promise((r) => setTimeout(r, 2000))
@@ -316,7 +399,7 @@ export class Bridge {
     }
   }
 
-  private onEvent(e: { id?: string; type: string; properties?: Record<string, unknown> }): void {
+  private onEvent(e: { id?: string; type: string; properties?: Record<string, unknown> }, directory: string): void {
     if (e.id) {
       if (this.seenEvents.has(e.id)) return
       this.seenEvents.add(e.id)
@@ -328,6 +411,15 @@ export class Bridge {
     } else if (e.type === "session.status") {
       const status = props.status as { type?: string } | undefined
       if (status?.type === "idle") void this.becameIdle(String(props.sessionID))
+    } else if (e.type === "permission.asked") {
+      this.onPermissionAsked(props, directory)
+    } else if (e.type === "permission.replied") {
+      const requestID = String(props.requestID ?? props.permissionID ?? "")
+      const entry = this.pendingPermissions.get(requestID)
+      if (entry) {
+        clearTimeout(entry.timer)
+        this.pendingPermissions.delete(requestID)
+      }
     }
   }
 
@@ -341,7 +433,12 @@ export class Bridge {
     if (inflight) await this.resolveReply(rt, inflight)
     rt.queue.dropExpired()
     const next = rt.queue.shift()
-    if (next) await this.inject(rt, next)
+    if (next) {
+      await this.inject(rt, next)
+      return
+    }
+    const wake = rt.wakes.shift()
+    if (wake) await this.deliverWake(rt, wake.messageID, wake.text, wake.serverUrl, wake.chatId)
   }
 
   private async resolveReply(rt: Runtime, inflight: Inflight): Promise<void> {
@@ -374,6 +471,184 @@ export class Bridge {
     }
   }
 
+  // ---------- permissions ----------
+
+  private onPermissionAsked(props: Record<string, unknown>, directory: string): void {
+    const id = String(props.id ?? props.permissionID ?? "")
+    const sessionID = String(props.sessionID ?? "")
+    if (!id || !sessionID) return
+    const permission = String(props.permission ?? props.tool ?? "?")
+    const raw: unknown[] = Array.isArray(props.patterns)
+      ? props.patterns
+      : props.pattern != null
+        ? [props.pattern]
+        : props.metadata && typeof props.metadata === "object" && (props.metadata as { command?: unknown }).command != null
+          ? [(props.metadata as { command?: unknown }).command]
+          : []
+    const patterns = raw.map((p) => (typeof p === "string" ? p : JSON.stringify(p)))
+
+    if (matchesAllow(this.cfg.permissions?.allow, { permission, patterns })) {
+      log("permission", `auto-allow ${permission} patterns=${patterns.join(" | ") || "-"}`)
+      void this.replyPermission(sessionID, id, "once", directory)
+      return
+    }
+
+    const rt = this.runtimes.get(sessionID)
+    const chatId = rt?.lastChatId
+    if (!rt || !chatId) {
+      warn("permission", `no feishu channel for ${permission} id=${id} session=${sessionID}; left pending`)
+      return
+    }
+    const timeoutSec = this.cfg.permissions?.approvalTimeoutSec ?? 300
+    const timer = setTimeout(() => {
+      const entry = this.pendingPermissions.get(id)
+      if (!entry) return
+      this.pendingPermissions.delete(id)
+      void this.replyPermission(entry.sessionID, entry.id, "reject", entry.directory)
+      const bot = this.byBot.get(entry.botName)
+      if (bot) void bot.feishu.sendText(entry.chatId, `审批 ${entry.id} 超时，已拒绝`)
+    }, timeoutSec * 1000)
+    timer.unref?.()
+    this.pendingPermissions.set(id, { id, sessionID, directory, permission, patterns, chatId, botName: rt.name, createdAt: Date.now(), timer })
+    const text = `[Kilo] 需要审批\nid: ${id}\n权限: ${permission}\n目标: ${patterns.join(", ") || "-"}\n回复 /allow ${id} 或 /deny ${id}（${timeoutSec}s 后自动拒绝）`
+    log("permission", `ask ${permission} id=${id} -> feishu ${chatId}`)
+    void rt.feishu.sendText(chatId, text)
+  }
+
+  private async resolvePermission(id: string, allow: boolean): Promise<string> {
+    const entry = this.pendingPermissions.get(id)
+    if (!entry) return `未找到待审批 ${id}`
+    this.pendingPermissions.delete(id)
+    clearTimeout(entry.timer)
+    await this.replyPermission(entry.sessionID, entry.id, allow ? "once" : "reject", entry.directory)
+    return allow ? `已放行 ${id}` : `已拒绝 ${id}`
+  }
+
+  private async replyPermission(sessionID: string, permissionID: string, response: "once" | "always" | "reject", directory?: string): Promise<void> {
+    try {
+      await this.client.postSessionIdPermissionsPermissionId({
+        path: { id: sessionID, permissionID },
+        body: { response },
+        query: directory ? { directory } : undefined,
+      })
+      log("permission", `reply ${response} id=${permissionID} session=${sessionID}`)
+    } catch (err) {
+      warn("permission", `reply ${response} id=${permissionID} failed: ${String(err)}`)
+    }
+  }
+
+  // ---------- terminal ----------
+
+  private clientFor(serverUrl?: string): KiloClient {
+    if (!serverUrl) return this.client
+    const norm = serverUrl.replace(/\/+$/, "")
+    if (norm === this.daemonUrl.replace(/\/+$/, "")) return this.client
+    let c = this.wakeClients.get(norm)
+    if (!c) {
+      c = createKiloClient({ baseUrl: norm })
+      this.wakeClients.set(norm, c)
+    }
+    return c
+  }
+
+  private async promptWake(sessionId: string, directory: string, messageID: string, text: string, serverUrl?: string): Promise<void> {
+    const client = this.clientFor(serverUrl)
+    try {
+      await promptAsync(client, sessionId, directory, this.model(), messageID, text)
+    } catch (err) {
+      if (client === this.client) throw err
+      warn("bridge", `wake via ${serverUrl} failed, retry via daemon: ${String(err)}`)
+      await promptAsync(this.client, sessionId, directory, this.model(), messageID, text)
+    }
+  }
+
+  /**
+   * Deliver an injected message into a session and return the user-message id used (for reply routing).
+   * In "tui" wake mode this goes through the attached TUI window (append-prompt + submit-prompt) so it
+   * renders as a normal local turn instead of a server-side prompt_async that the TUI shows as QUEUED.
+   */
+  private async deliver(sessionId: string, directory: string, messageID: string, text: string, serverUrl?: string): Promise<string> {
+    if (this.wakeMode === "tui") {
+      const actual = await this.tuiDeliver(sessionId, directory, text)
+      if (actual) return actual
+      warn("bridge", `tui wake not confirmed for ${sessionId}; falling back to promptAsync`)
+    }
+    await this.promptWake(sessionId, directory, messageID, text, serverUrl)
+    return messageID
+  }
+
+  /** Submit text via the attached TUI; returns the created user-message id, or null if no window handled it. */
+  private async tuiDeliver(sessionId: string, directory: string, text: string): Promise<string | null> {
+    const t0 = Date.now()
+    try {
+      await this.client.tui.appendPrompt({ body: { text }, query: { directory } })
+      await this.client.tui.submitPrompt({ query: { directory } })
+    } catch (err) {
+      warn("bridge", `tui deliver failed: ${String(err)}`)
+      return null
+    }
+    for (let i = 0; i < 15; i++) {
+      await new Promise((r) => setTimeout(r, 200))
+      try {
+        const msgs = await getMessages(this.client, sessionId, directory)
+        let best: { id: string; created: number } | null = null
+        for (const m of msgs) {
+          const created = (m.info as { time?: { created?: number } }).time?.created ?? 0
+          if (created < t0 || m.info.role !== "user") continue
+          const body = m.parts.map((p) => (p.type === "text" ? p.text : "")).join("")
+          if (body === text && (!best || created > best.created)) best = { id: m.info.id, created }
+        }
+        if (best) return best.id
+      } catch {
+        // ignore transient read errors
+      }
+    }
+    return null
+  }
+
+  private onTerminalDone(s: TerminalSession): void {
+    const status = s.cancelled
+      ? "cancelled"
+      : `exited code=${s.exitCode ?? "null"}${s.signal ? ` signal=${s.signal}` : ""}`
+    const tail = this.terminals.tail(s)
+    const text = `[terminal ${s.id}] ${status}${s.truncated ? " (output truncated)" : ""}\nlast output:\n${tail || "(none)"}`
+    log("terminal", `done id=${s.id} ${status} owner=${s.ownerSessionID ?? "-"} server=${s.ownerServerUrl ?? "-"}`)
+    if (s.ownerSessionID) {
+      const chatId = this.runtimes.get(s.ownerSessionID)?.lastChatId
+      this.wakeSession(s.ownerSessionID, s.ownerDirectory ?? "", `msg_terminal_${s.id}_${Date.now().toString(36)}`, text, s.ownerServerUrl, chatId)
+    }
+  }
+
+  private wakeSession(sessionId: string, directory: string, messageID: string, text: string, serverUrl?: string, chatId?: string): void {
+    const rt = this.runtimes.get(sessionId)
+    if (!rt) {
+      void this.deliver(sessionId, directory, messageID, text, serverUrl).catch((err) =>
+        warn("bridge", `wake ${sessionId} failed: ${String(err)}`),
+      )
+      return
+    }
+    if (!rt.busy && !rt.inflight && rt.queue.size === 0) {
+      void this.deliverWake(rt, messageID, text, serverUrl, chatId)
+      return
+    }
+    rt.wakes.push({ messageID, text, serverUrl, chatId })
+    log("bridge", `wake queued for ${rt.name} (wakes=${rt.wakes.length})`)
+  }
+
+  private async deliverWake(rt: Runtime, messageID: string, text: string, serverUrl?: string, chatId?: string): Promise<void> {
+    rt.busy = true
+    if (chatId) rt.inflight = { injectedId: messageID, chatId }
+    try {
+      const actualId = await this.deliver(rt.sessionId, rt.directory, messageID, text, serverUrl)
+      if (rt.inflight) rt.inflight.injectedId = actualId
+      log("bridge", `woke ${rt.sessionId} (${actualId})`)
+    } catch (err) {
+      rt.busy = false
+      rt.inflight = undefined
+      warn("bridge", `wake failed: ${String(err)}`)
+    }
+  }
+
   // ---------- timers ----------
 
   private onTimerFire(t: TimerRecord, missed: boolean): void {
@@ -387,12 +662,12 @@ export class Bridge {
       if (rt && b) void rt.feishu.sendText(b, text)
       else log("timer", `fired but bot ${a} not found: ${text}`)
       if (rt && !rt.busy) {
-        void promptAsync(this.client, rt.sessionId, rt.directory, this.model(), `msg_timer_${t.id}`, wake).catch(() => {})
+        void this.deliver(rt.sessionId, rt.directory, `msg_timer_${t.id}`, wake).catch(() => {})
       }
       return
     }
     if (kind === "session") {
-      void promptAsync(this.client, b, a, this.model(), `msg_timer_${t.id}`, wake).catch(() => {})
+      void this.deliver(b, a, `msg_timer_${t.id}`, wake).catch(() => {})
       log("timer", `woke session ${b}: ${text}`)
       return
     }

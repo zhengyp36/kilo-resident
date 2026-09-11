@@ -10,8 +10,15 @@
   "scripts": {
     "start": "node src/index.ts",
     "dev": "node --watch src/index.ts",
+    "up": "bash scripts/residentctl.sh start",
+    "down": "bash scripts/residentctl.sh stop",
+    "restart": "bash scripts/residentctl.sh restart",
+    "status": "bash scripts/residentctl.sh status",
+    "attach": "bash scripts/residentctl.sh attach",
     "typecheck": "tsc --noEmit",
-    "test:roundtrip": "node test/roundtrip.ts"
+    "test:roundtrip": "node test/roundtrip.ts",
+    "test:terminal": "node test/terminal.ts",
+    "test:permission": "node test/permission.ts"
   },
   "dependencies": {
     "@kilocode/plugin": "^7.3.21",

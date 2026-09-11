@@ -1,10 +1,20 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { log } from "./log.ts"
 
+export interface TerminalHandlers {
+  open(body: Record<string, unknown>): unknown
+  exec(body: Record<string, unknown>): unknown
+  observe(body: Record<string, unknown>): unknown
+  cancel(body: Record<string, unknown>): unknown
+  list(): unknown
+  close(body: Record<string, unknown>): unknown
+}
+
 export interface ControlHandlers {
   list(): unknown
   set(body: Record<string, unknown>): unknown
   cancel(id: string): unknown
+  terminal?: TerminalHandlers
 }
 
 export interface ControlServer {
@@ -60,6 +70,24 @@ async function handle(req: IncomingMessage, res: ServerResponse, token: string, 
       const body = await readBody(req)
       send(res, 200, { timer: h.cancel(String(body.id ?? "")) })
       return
+    }
+    if (h.terminal) {
+      const t = h.terminal
+      if (req.method === "GET" && url.pathname === "/terminal") {
+        send(res, 200, { sessions: await t.list() })
+        return
+      }
+      if (req.method === "POST" && url.pathname.startsWith("/terminal/")) {
+        const body = await readBody(req)
+        const op = url.pathname.slice("/terminal/".length)
+        if (op === "open") return send(res, 200, { terminal: await t.open(body) })
+        if (op === "exec") return send(res, 200, { terminal: await t.exec(body) })
+        if (op === "observe") return send(res, 200, { terminal: await t.observe(body) })
+        if (op === "cancel") return send(res, 200, { terminal: await t.cancel(body) })
+        if (op === "close") return send(res, 200, { terminal: await t.close(body) })
+        send(res, 404, { error: `unknown terminal op: ${op}` })
+        return
+      }
     }
     send(res, 404, { error: "not found" })
   } catch (err) {

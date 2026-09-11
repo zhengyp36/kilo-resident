@@ -1,3 +1,5 @@
+import type { PermissionRule } from "./permission.ts"
+
 export type Trust = "superuser" | "guest" | "deny"
 
 export interface Account {
@@ -23,7 +25,12 @@ export interface Config {
   bots: BotConfig[]
   queue?: { maxWaitMs?: number }
   timers?: { maxActive?: number; minIntervalSec?: number }
+  terminal?: { maxOutput?: number; defaultObserveLimit?: number }
+  /** Command/tool whitelist for auto-approving permission.asked. Non-matching requests are forwarded to Feishu for manual approval. */
+  permissions?: { allow?: PermissionRule[]; approvalTimeoutSec?: number }
   control?: { port?: number; token?: string }
+  /** Wake delivery: "async" = server-side prompt_async (headless-safe); "tui" = submit via the attached TUI window so it renders as a normal turn. */
+  wake?: { mode?: "async" | "tui" }
 }
 
 export interface TimerRecord {

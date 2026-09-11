@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Attach a TUI window to the resident Kilo server.
+# Usage: attach-kilo [session|new|-] [dir]
+#   (no arg)   continue the session pinned by the bridge (state.json)
+#   new | -    start a fresh session (like /new)
+#   <id>       continue the given session id
+set -euo pipefail
+
+HOST="${KILO_RESIDENT_HOST:-127.0.0.1}"
+PORT="${KILO_RESIDENT_PORT:-4097}"
+USER="${KILO_RESIDENT_USER:-kilo}"
+PASS="${KILO_RESIDENT_PASS:-kilo}"
+REPO="${KILO_RESIDENT_REPO:-$HOME/work/B/kilo-resident}"
+STATE="${KILO_RESIDENT_STATE:-$REPO/state.json}"
+
+session="${1:-}"
+dir="${2:-$PWD}"
+if [[ -z "$session" ]]; then
+  if [[ -f "$STATE" ]]; then
+    session="$(node -e 'try{const s=require(process.argv[1]);process.stdout.write(s.sessions?.["KILO-LOCUS-A"]??"")}catch{}' "$STATE" 2>/dev/null || true)"
+  fi
+elif [[ "$session" == "new" || "$session" == "-" ]]; then
+  session=""
+fi
+
+args=("http://$HOST:$PORT" -u "$USER" -p "$PASS")
+[[ -n "$session" ]] && args+=(-s "$session")
+[[ -n "$dir" ]] && args+=(--dir "$dir")
+
+echo "attach: http://$HOST:$PORT${session:+ session=$session}${dir:+ dir=$dir}"
+export TERM=xterm-256color
+exec kilo attach "${args[@]}"
