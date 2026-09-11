@@ -6,11 +6,13 @@ export interface QueueEntry<T> {
 /** FIFO queue with a wait timeout. Busy state is driven externally by session events. */
 export class SessionQueue<T> {
   private entries: QueueEntry<T>[] = []
+  private readonly maxWaitMs: number
+  private readonly onDrop: (item: T) => void
 
-  constructor(
-    private maxWaitMs: number,
-    private onDrop: (item: T) => void,
-  ) {}
+  constructor(maxWaitMs: number, onDrop: (item: T) => void) {
+    this.maxWaitMs = maxWaitMs
+    this.onDrop = onDrop
+  }
 
   push(item: T): void {
     this.entries.push({ item, enqueuedAt: Date.now() })

@@ -34,15 +34,18 @@ export class Bridge {
   private readonly timers: TimerStore
   private readonly seenEvents = new Set<string>()
   private readonly seenInbound = new Set<string>()
+  private readonly cfg: Config
+  private readonly state: State
+  private readonly stateFile: string
+  private readonly creds: Map<string, FeishuCreds>
 
-  constructor(
-    private readonly cfg: Config,
-    private readonly state: State,
-    private readonly stateFile: string,
-    private readonly creds: Map<string, FeishuCreds>,
-  ) {
+  constructor(cfg: Config, state: State, stateFile: string, creds: Map<string, FeishuCreds>) {
+    this.cfg = cfg
+    this.state = state
+    this.stateFile = stateFile
+    this.creds = creds
     const daemon =
-      cfg.daemon?.url != null
+      cfg.daemon?.url
         ? { url: cfg.daemon.url, username: cfg.daemon.username, password: cfg.daemon.password }
         : loadDaemon()
     if (!daemon?.url) throw new Error("daemon not found: start `kilo daemon start` or set config.daemon.url")
@@ -86,9 +89,10 @@ export class Bridge {
       log("bridge", `bot ${bot.name} dir=${bot.directory} session=${sessionId}`)
     }
 
-    void this.subscribeEvents()
+    const dirs = new Set([...this.byBot.values()].map((r) => r.directory))
+    for (const dir of dirs) void this.subscribeEvents(dir)
     this.timers.start()
-    log("bridge", `ready (${this.byBot.size} bot(s), daemon=${JSON.stringify(this.cfg.daemon?.url ?? "daemon.json")})`)
+    log("bridge", `ready (${this.byBot.size} bot(s), ${dirs.size} dir(s))`)
   }
 
   private model(): Model {
@@ -160,13 +164,13 @@ export class Bridge {
 
   // ---------- events ----------
 
-  private async subscribeEvents(): Promise<void> {
+  private async subscribeEvents(directory: string): Promise<void> {
     for (;;) {
       try {
-        const sub = await this.client.event.subscribe()
+        const sub = await this.client.event.subscribe({ query: { directory } })
         for await (const ev of sub.stream) this.onEvent(ev as { id?: string; type: string; properties?: Record<string, unknown> })
       } catch (err) {
-        warn("bridge", `event stream ended (${String(err)}); reconnecting in 2s`)
+        warn("bridge", `event stream[${directory}] ended (${String(err)}); reconnecting in 2s`)
         await new Promise((r) => setTimeout(r, 2000))
       }
     }

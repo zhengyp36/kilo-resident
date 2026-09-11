@@ -17,11 +17,15 @@ export interface TimerOptions {
  * crash mid-delivery re-fires on the next start rather than silently dropping.
  */
 export class TimerStore {
-  constructor(
-    private timers: TimerRecord[],
-    private onFire: TimerFire,
-    private opts: TimerOptions,
-  ) {}
+  private readonly timers: TimerRecord[]
+  private readonly onFire: TimerFire
+  private readonly opts: TimerOptions
+
+  constructor(timers: TimerRecord[], onFire: TimerFire, opts: TimerOptions) {
+    this.timers = timers
+    this.onFire = onFire
+    this.opts = opts
+  }
 
   list(): TimerRecord[] {
     return this.timers

@@ -17,9 +17,11 @@ export class FeishuBot {
   readonly client: lark.Client
   private readonly ws: lark.WSClient
   readonly name: string
+  private readonly onMessage: (m: InboundMessage) => void
 
-  constructor(creds: FeishuCreds, private onMessage: (m: InboundMessage) => void) {
+  constructor(creds: FeishuCreds, onMessage: (m: InboundMessage) => void) {
     this.name = creds.name
+    this.onMessage = onMessage
     this.client = new lark.Client({ appId: creds.app_id, appSecret: creds.app_secret })
     this.ws = new lark.WSClient({
       appId: creds.app_id,
