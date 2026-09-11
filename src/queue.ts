@@ -26,6 +26,10 @@ export class SessionQueue<T> {
     return this.entries.length
   }
 
+  clear(): void {
+    this.entries = []
+  }
+
   /** Drop entries that have waited longer than maxWaitMs. Returns dropped items. */
   dropExpired(now = Date.now()): T[] {
     const kept: QueueEntry<T>[] = []

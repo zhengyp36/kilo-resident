@@ -1,5 +1,5 @@
 import { matchAccount, loadDaemon, type FeishuCreds } from "./config.ts"
-import { makeKiloClient, createSession, listSessionIds, getMessages, promptAsync, type Model } from "./kilo.ts"
+import { makeKiloClient, createSession, listSessionIds, getMessages, promptAsync, summarize, type Model } from "./kilo.ts"
 import type { KiloClient } from "@kilocode/sdk"
 import { FeishuBot, type InboundMessage } from "./feishu.ts"
 import { SessionQueue } from "./queue.ts"
@@ -134,8 +134,72 @@ export class Bridge {
       log("bridge", "ignore empty or non-text message")
       return
     }
+    if (msg.text.trimStart().startsWith("/")) {
+      void this.handleCommand(rt, msg)
+      return
+    }
     log("bridge", `inbound bot=${botName} from=${acc.name ?? "?"} chat=${msg.chatId}: ${msg.text.slice(0, 80)}`)
     this.submit(rt, { ...msg, trust: acc.trust })
+  }
+
+  private async handleCommand(rt: Runtime, msg: InboundMessage): Promise<void> {
+    const [cmd, ...rest] = msg.text.trim().slice(1).split(/\s+/)
+    const arg = rest.join(" ").trim()
+    const reply = (t: string) => rt.feishu.sendText(msg.chatId, t)
+    log("bridge", `command /${cmd} ${arg}`)
+    try {
+      switch (cmd) {
+        case "new": {
+          const old = rt.sessionId
+          const id = await createSession(this.client, rt.directory, "resident")
+          this.state.sessions[rt.name] = id
+          saveState(this.stateFile, this.state)
+          this.runtimes.delete(old)
+          rt.sessionId = id
+          rt.inflight = undefined
+          rt.busy = false
+          rt.queue.clear()
+          this.runtimes.set(id, rt)
+          await reply(`已开新会话 ${id}\n(旧 ${old})`)
+          break
+        }
+        case "compact":
+        case "summarize": {
+          if (rt.busy || rt.inflight) {
+            await reply("当前正忙，等这轮结束再 /compact")
+            break
+          }
+          await summarize(this.client, rt.sessionId, rt.directory, this.model())
+          await reply("已原地压缩上下文（同 session）")
+          break
+        }
+        case "timers": {
+          const list = this.timers.list().filter((t) => t.status === "pending")
+          if (list.length === 0) {
+            await reply("没有待触发的 timer")
+            break
+          }
+          await reply("待触发 timer:\n" + list.map((t) => `${t.id}  ${new Date(t.fireAt).toLocaleString()}  ${t.title}`).join("\n"))
+          break
+        }
+        case "cancel": {
+          if (!arg) {
+            await reply("用法: /cancel <timer id>")
+            break
+          }
+          const t = this.timers.cancel(arg)
+          await reply(t ? `已取消 ${t.id}` : `未找到待触发的 timer ${arg}`)
+          break
+        }
+        case "help":
+        default:
+          await reply("命令:\n/new 新会话\n/compact 压缩上下文\n/timers 列 timer\n/cancel <id> 取消 timer\n/help 帮助")
+          break
+      }
+    } catch (err) {
+      warn("bridge", `command /${cmd} failed: ${String(err)}`)
+      await reply(`命令 /${cmd} 执行失败: ${String(err).slice(0, 120)}`)
+    }
   }
 
   private submit(rt: Runtime, item: Inbound): void {
