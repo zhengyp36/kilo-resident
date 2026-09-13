@@ -19,6 +19,7 @@
     "test:roundtrip": "node test/roundtrip.ts",
     "test:terminal": "node test/terminal.ts",
     "test:permission": "node test/permission.ts",
+    "test:permission-retry": "node test/permission-retry.ts",
     "test:phone": "node test/phone.ts"
   },
   "dependencies": {

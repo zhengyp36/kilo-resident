@@ -21,7 +21,8 @@
       { "permission": "bash", "pattern": "git diff*" },
       { "permission": "bash", "pattern": "git log*" }
     ],
-    "approvalTimeoutSec": 300
+    "approvalTimeoutSec": 300,
+    "maxRetries": 3
   },
   "control": { "port": 4180, "token": "" },
   "wake": { "mode": "async" },

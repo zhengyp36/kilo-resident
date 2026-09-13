@@ -17,6 +17,8 @@ export interface BotConfig {
   directory: string
   /** Pinned Kilo session id (optional; bridge persists one if empty). */
   session?: string
+  /** Feishu chat to route approvals to before the human has messaged (proactive). */
+  notifyChat?: string
 }
 
 export interface Config {
@@ -28,7 +30,7 @@ export interface Config {
   timers?: { maxActive?: number; minIntervalSec?: number }
   terminal?: { maxOutput?: number; defaultObserveLimit?: number }
   /** Command/tool whitelist for auto-approving permission.asked. Non-matching requests are forwarded to Feishu for manual approval. */
-  permissions?: { allow?: PermissionRule[]; approvalTimeoutSec?: number }
+  permissions?: { allow?: PermissionRule[]; approvalTimeoutSec?: number; maxRetries?: number }
   control?: { port?: number; token?: string }
   /** Loopback wake delivery: "async" = server-side prompt_async (headless-safe); "tui" = submit via the attached TUI window so it renders as a normal turn. */
   wake?: { mode?: "async" | "tui" }

@@ -35,7 +35,11 @@ interface PendingPermission {
   chatId: string
   botName: string
   createdAt: number
-  timer: NodeJS.Timeout
+  timer?: NodeJS.Timeout
+  /** True once the approval window elapsed without a human reply (tool call released). */
+  expired: boolean
+  /** How many times /retry re-drove this permission. */
+  retryCount: number
 }
 
 interface Runtime {
@@ -411,22 +415,46 @@ export class Bridge {
           break
         }
         case "pending": {
-          if (this.pendingPermissions.size === 0) {
+          const all = [...this.pendingPermissions.values()]
+          const active = all.filter((p) => !p.expired)
+          const expired = all.filter((p) => p.expired)
+          if (all.length === 0) {
             await reply("没有待审批的权限请求")
             break
           }
-          await reply(
-            "待审批:\n" +
-              [...this.pendingPermissions.values()]
-                .map((p) => `${p.id}  ${p.permission}  ${p.patterns.join(", ") || "-"}`)
-                .join("\n"),
-          )
+          const fmt = (p: PendingPermission) => `${p.id}  ${p.permission}  ${p.patterns.join(", ") || "-"}`
+          const parts: string[] = []
+          if (active.length) parts.push("待审批:\n" + active.map(fmt).join("\n"))
+          if (expired.length) parts.push("已超时释放（可 /retry）:\n" + expired.map(fmt).join("\n"))
+          await reply(parts.join("\n\n"))
+          break
+        }
+        case "retry": {
+          if (!arg) {
+            await reply("用法: /retry <审批 id>\n先发 /pending 查看 id")
+            break
+          }
+          const entry = this.pendingPermissions.get(arg)
+          if (!entry) {
+            await reply(`未找到审批 ${arg}`)
+            break
+          }
+          const max = this.cfg.permissions?.maxRetries ?? 3
+          entry.retryCount += 1
+          const text =
+            `[审批重试] 审批 ${entry.id} 未执行${entry.expired ? "（已超时释放）" : ""}。` +
+            `请重新发起该操作：${entry.permission} ${entry.patterns.join(", ") || "-"}。` +
+            `如需授权会再发审批给你。`
+          const warning = entry.retryCount > max ? `\n注意: 已重发 ${entry.retryCount} 次，超过建议上限 ${max}` : ""
+          await reply(`已请求重新发起 ${entry.id}（第 ${entry.retryCount} 次）${warning}`)
+          this.wakeSession(entry.sessionID, entry.directory, `msg_retry_${entry.id}_${Date.now().toString(36)}`, text, undefined, entry.chatId)
+          log("permission", `retry ${entry.permission} id=${entry.id} count=${entry.retryCount}`)
           break
         }
         case "help":
         default:
           await reply(
-            "命令:\n/new 新会话\n/sessions 列会话\n/pin <编号> 切换会话\n/compact 压缩上下文\n/timers 列 timer\n/timer <分钟后> <标题> 设 timer\n/cancel <id> 取消 timer\n/pending 列待审批\n/allow <id> 放行审批\n/deny <id> 拒绝审批\n/help 帮助",
+            "命令:\n/new 新会话\n/sessions 列会话\n/pin <编号> 切换会话\n/compact 压缩上下文\n/timers 列 timer\n/timer <分钟后> <标题> 设 timer\n/cancel <id> 取消 timer\n/pending 列待审批\n/allow <id> 放行审批\n/deny <id> 拒绝审批\n/retry <id> 重新发起审批\n/help 帮助",
           )
           break
       }
@@ -493,8 +521,9 @@ export class Bridge {
       const requestID = String(props.requestID ?? props.permissionID ?? "")
       const entry = this.pendingPermissions.get(requestID)
       if (entry) {
-        clearTimeout(entry.timer)
-        this.pendingPermissions.delete(requestID)
+        if (entry.timer) clearTimeout(entry.timer)
+        entry.timer = undefined
+        if (!entry.expired) this.pendingPermissions.delete(requestID)
       }
     }
   }
@@ -592,32 +621,49 @@ export class Bridge {
     }
 
     const rt = this.runtimes.get(sessionID)
-    const chatId = rt?.lastChatId
-    if (!rt || !chatId) {
+    const botCfg = this.cfg.bots.find((b) => b.directory === directory)
+    const chatId = rt?.lastChatId ?? botCfg?.notifyChat
+    const botName = rt?.name ?? botCfg?.name
+    if (!chatId || !botName) {
       warn("permission", `no feishu channel for ${permission} id=${id} session=${sessionID}; left pending`)
       return
     }
     const timeoutSec = this.cfg.permissions?.approvalTimeoutSec ?? 300
-    const timer = setTimeout(() => {
-      const entry = this.pendingPermissions.get(id)
-      if (!entry) return
-      this.pendingPermissions.delete(id)
-      void this.replyPermission(entry.sessionID, entry.id, "reject", entry.directory)
-      const bot = this.byBot.get(entry.botName)
-      if (bot) void bot.feishu.sendText(entry.chatId, `审批 ${entry.id} 超时，已拒绝`)
-    }, timeoutSec * 1000)
-    timer.unref?.()
-    this.pendingPermissions.set(id, { id, sessionID, directory, permission, patterns, chatId, botName: rt.name, createdAt: Date.now(), timer })
-    const text = `[Kilo] 需要审批\nid: ${id}\n权限: ${permission}\n目标: ${patterns.join(", ") || "-"}\n回复 /allow ${id} 或 /deny ${id}（${timeoutSec}s 后自动拒绝）`
+    const entry: PendingPermission = {
+      id, sessionID, directory, permission, patterns, chatId, botName,
+      createdAt: Date.now(), expired: false, retryCount: 0,
+    }
+    entry.timer = setTimeout(() => this.expirePermission(id), timeoutSec * 1000)
+    entry.timer.unref?.()
+    this.pendingPermissions.set(id, entry)
+    const text = `[Kilo] 需要审批\nid: ${id}\n权限: ${permission}\n目标: ${patterns.join(", ") || "-"}\n回复 /allow ${id} 或 /deny ${id}（${timeoutSec}s 后自动释放，可用 /retry ${id} 重新发起）`
     log("permission", `ask ${permission} id=${id} -> feishu ${chatId}`)
-    void rt.feishu.sendText(chatId, text)
+    void (rt?.feishu ?? this.byBot.get(botName)?.feishu)?.sendText(chatId, text)
+  }
+
+  /**
+   * The approval window elapsed. Release the tool call (SDK only allows once/always/reject,
+   * so we reply reject) but keep the record, marked expired, so the human can later /retry it.
+   */
+  private expirePermission(id: string): void {
+    const entry = this.pendingPermissions.get(id)
+    if (!entry || entry.expired) return
+    entry.expired = true
+    if (entry.timer) clearTimeout(entry.timer)
+    entry.timer = undefined
+    void this.replyPermission(entry.sessionID, entry.id, "reject", entry.directory)
+    const bot = this.byBot.get(entry.botName)
+    if (bot) void bot.feishu.sendText(entry.chatId, `审批 ${entry.id} 超时，已释放（未执行）。发 /retry ${entry.id} 可让我重新发起。`)
+    log("permission", `expired ${entry.permission} id=${entry.id}`)
   }
 
   private async resolvePermission(id: string, allow: boolean): Promise<string> {
     const entry = this.pendingPermissions.get(id)
     if (!entry) return `未找到待审批 ${id}`
+    if (entry.expired) return `审批 ${id} 已超时释放；发 /retry ${id} 让我重新发起`
     this.pendingPermissions.delete(id)
-    clearTimeout(entry.timer)
+    if (entry.timer) clearTimeout(entry.timer)
+    entry.timer = undefined
     await this.replyPermission(entry.sessionID, entry.id, allow ? "once" : "reject", entry.directory)
     return allow ? `已放行 ${id}` : `已拒绝 ${id}`
   }
