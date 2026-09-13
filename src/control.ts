@@ -10,11 +10,19 @@ export interface TerminalHandlers {
   close(body: Record<string, unknown>): unknown
 }
 
+export interface PhoneHandlers {
+  open(body: Record<string, unknown>): unknown
+  send(body: Record<string, unknown>): unknown
+  status(): unknown
+  close(): unknown
+}
+
 export interface ControlHandlers {
   list(): unknown
   set(body: Record<string, unknown>): unknown
   cancel(id: string): unknown
   terminal?: TerminalHandlers
+  phone?: PhoneHandlers
 }
 
 export interface ControlServer {
@@ -70,6 +78,27 @@ async function handle(req: IncomingMessage, res: ServerResponse, token: string, 
       const body = await readBody(req)
       send(res, 200, { timer: h.cancel(String(body.id ?? "")) })
       return
+    }
+    if (h.phone) {
+      const p = h.phone
+      if (req.method === "POST" && url.pathname === "/phone/open") {
+        const body = await readBody(req)
+        send(res, 200, { phone: await p.open(body) })
+        return
+      }
+      if (req.method === "POST" && url.pathname === "/phone/send") {
+        const body = await readBody(req)
+        send(res, 200, { phone: await p.send(body) })
+        return
+      }
+      if (req.method === "GET" && url.pathname === "/phone/status") {
+        send(res, 200, { phone: p.status() })
+        return
+      }
+      if (req.method === "POST" && url.pathname === "/phone/close") {
+        send(res, 200, { phone: await p.close() })
+        return
+      }
     }
     if (h.terminal) {
       const t = h.terminal

@@ -18,7 +18,8 @@
     "typecheck": "tsc --noEmit",
     "test:roundtrip": "node test/roundtrip.ts",
     "test:terminal": "node test/terminal.ts",
-    "test:permission": "node test/permission.ts"
+    "test:permission": "node test/permission.ts",
+    "test:phone": "node test/phone.ts"
   },
   "dependencies": {
     "@kilocode/plugin": "^7.3.21",

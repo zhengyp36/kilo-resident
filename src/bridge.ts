@@ -5,6 +5,7 @@ import { FeishuBot, type InboundMessage } from "./feishu.ts"
 import { SessionQueue } from "./queue.ts"
 import { TimerStore } from "./timer.ts"
 import { TerminalManager, type TerminalSession } from "./terminal.ts"
+import { PhoneManager, formatInbound, type PhoneInbound } from "./phone.ts"
 import { matchesAllow } from "./permission.ts"
 import { startControl, type ControlServer } from "./control.ts"
 import { log, warn } from "./log.ts"
@@ -78,6 +79,8 @@ export class Bridge {
   private readonly creds: Map<string, FeishuCreds>
   private readonly wakeMode: "async" | "tui"
   private control?: ControlServer
+  private phone?: PhoneManager
+  private phoneBound?: { sessionID: string; directory: string; serverUrl?: string }
 
   constructor(cfg: Config, state: State, stateFile: string, creds: Map<string, FeishuCreds>) {
     this.cfg = cfg
@@ -212,6 +215,12 @@ export class Bridge {
         cancel: (b) => this.terminals.cancel(b.id),
         list: () => this.terminals.list(),
         close: (b) => this.terminals.close(b.id),
+      },
+      phone: {
+        open: (b) => this.phoneOpen(b),
+        send: (b) => this.phoneSend(b),
+        status: () => this.phone?.status() ?? { running: false },
+        close: () => this.phoneClose(),
       },
     })
     this.writeControlFile(port, token)
@@ -736,6 +745,55 @@ export class Bridge {
       rt.inflight = undefined
       warn("bridge", `wake failed: ${String(err)}`)
     }
+  }
+
+  // ---------- phone (agent <-> Kilo channel) ----------
+
+  private ensurePhone(): PhoneManager {
+    if (!this.phone) {
+      if (!this.cfg.phone) throw new Error("phone not configured (config.phone)")
+      this.phone = new PhoneManager(this.cfg.phone, (p) => this.onPhoneInbound(p))
+    }
+    return this.phone
+  }
+
+  private async phoneOpen(b: Record<string, unknown>): Promise<unknown> {
+    const sessionID = String(b.sessionID ?? "")
+    const directory = String(b.directory ?? "")
+    if (!sessionID) throw new Error("sessionID required")
+    const serverUrl = b.serverUrl != null ? String(b.serverUrl) : undefined
+    this.phoneBound = { sessionID, directory, serverUrl }
+    const url = await this.ensurePhone().open()
+    return { ok: true, url, number: this.cfg.phone?.number }
+  }
+
+  private async phoneSend(b: Record<string, unknown>): Promise<unknown> {
+    const to = String(b.to ?? "")
+    const text = String(b.text ?? "")
+    if (!to || !text) throw new Error("to and text required")
+    await this.ensurePhone().send(to, text)
+    return { ok: true }
+  }
+
+  private async phoneClose(): Promise<unknown> {
+    if (this.phone) await this.phone.close()
+    this.phoneBound = undefined
+    return { ok: true }
+  }
+
+  private onPhoneInbound(p: PhoneInbound): void {
+    const bound = this.phoneBound
+    if (!bound) {
+      warn("phone", "inbound with no bound session; dropping")
+      return
+    }
+    const text = formatInbound(p)
+    const mid = `msg_phone_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
+    log("phone", `inbound ${p.from} round=${p.round ?? "-"} -> ${bound.sessionID}`)
+    // No auto-reply: inject only. Kilo decides whether to call phone_send.
+    void this.deliver(bound.sessionID, bound.directory, mid, text, bound.serverUrl).catch((err) =>
+      warn("phone", `inject failed: ${String(err)}`),
+    )
   }
 
   // ---------- timers ----------

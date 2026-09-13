@@ -1,4 +1,5 @@
 import type { PermissionRule } from "./permission.ts"
+import type { PhoneConfig } from "./phone.ts"
 
 export type Trust = "superuser" | "guest" | "deny"
 
@@ -29,8 +30,10 @@ export interface Config {
   /** Command/tool whitelist for auto-approving permission.asked. Non-matching requests are forwarded to Feishu for manual approval. */
   permissions?: { allow?: PermissionRule[]; approvalTimeoutSec?: number }
   control?: { port?: number; token?: string }
-  /** Wake delivery: "async" = server-side prompt_async (headless-safe); "tui" = submit via the attached TUI window so it renders as a normal turn. */
+  /** Loopback wake delivery: "async" = server-side prompt_async (headless-safe); "tui" = submit via the attached TUI window so it renders as a normal turn. */
   wake?: { mode?: "async" | "tui" }
+  /** Kilo's own phone (agent<->Kilo channel). Open on demand; nothing auto-replies. */
+  phone?: PhoneConfig
 }
 
 export interface TimerRecord {

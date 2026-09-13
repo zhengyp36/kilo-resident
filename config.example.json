@@ -24,5 +24,13 @@
     "approvalTimeoutSec": 300
   },
   "control": { "port": 4180, "token": "" },
-  "wake": { "mode": "async" }
+  "wake": { "mode": "async" },
+  "phone": {
+    "number": "COGOS002:A0006",
+    "dataDir": "~/.cogos/kilo-phone",
+    "cogosDir": "<path to cogos checkout>",
+    "contacts": { "YZ": ["COGOS002:H0002"], "唐钰": ["COGOS002:A0005"] },
+    "python": "python3.11",
+    "maxConsecutive": 5
+  }
 }
