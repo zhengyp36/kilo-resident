@@ -30,12 +30,13 @@ export interface PhoneInbound {
   chat_id?: string
 }
 
-/** Render an inbound agent message as a sourced turn for the Kilo session. */
+/** Render an inbound phone message as a sourced turn for the Kilo session. */
 export function formatInbound(p: PhoneInbound): string {
   const round = p.round ?? 0
+  const who = p.source === "human" ? "真人来信" : "agent来信"
   const head = p.paused
-    ? `[agent来信] ${p.from} · 连续第 ${round} 轮已达上限`
-    : `[agent来信] ${p.from} · 第 ${round} 轮`
+    ? `[${who}] ${p.from} · 连续第 ${round} 轮已达上限`
+    : `[${who}] ${p.from} · 第 ${round} 轮`
   const tail = p.note ? `\n(${p.note})` : ""
   return `${head}：${p.content}${tail}`
 }

@@ -17,6 +17,12 @@ check(
   "formatInbound paused",
   formatInbound({ source: "agent", from: "X", content: "hi", round: 6, paused: true, note: "stop" }).includes("已达上限"),
 )
+check(
+  "formatInbound human",
+  formatInbound({ source: "human", from: "COGOS002:H0002", content: "hi", round: 1 }) ===
+    "[真人来信] COGOS002:H0002 · 第 1 轮：hi",
+  formatInbound({ source: "human", from: "COGOS002:H0002", content: "hi", round: 1 }),
+)
 
 const got: any[] = []
 const mgr = new PhoneManager(
