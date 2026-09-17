@@ -6,8 +6,13 @@
   ],
   "bots": [
     {
-      "name": "KILO-LOCUS-A",
-      "directory": "/home/zhengyp/work/B/locus",
+      "name": "KILO-LOCUS-B",
+      "directory": "/path/to/project-b",
+      "session": ""
+    },
+    {
+      "name": "KILO-DOCTOR",
+      "directory": "/path/to/doctor-project",
       "session": ""
     }
   ],

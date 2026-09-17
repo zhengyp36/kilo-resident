@@ -61,7 +61,7 @@ attach() {
   local state="$REPO/state.json"
   if [[ -z "$session" ]]; then
     if [[ -f "$state" ]]; then
-      session="$(node -e 'try{const s=require(process.argv[1]);process.stdout.write(s.sessions?.["KILO-LOCUS-A"]??"")}catch{}' "$state" 2>/dev/null || true)"
+      session="$(node -e 'const fs=require("fs");try{const st=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const cfg=JSON.parse(fs.readFileSync(process.argv[2],"utf8"));const dir=(process.argv[3]||"").replace(/\/+$/,"");const bots=cfg.bots||[];const bot=bots.find(function(b){return b.directory.replace(/\/+$/,"")===dir})||bots[0];process.stdout.write((bot&&st.sessions&&st.sessions[bot.name])||"")}catch{}' "$state" "$REPO/config.json" "$dir" 2>/dev/null || true)"
     fi
   elif [[ "$session" == "new" || "$session" == "-" ]]; then
     session=""
