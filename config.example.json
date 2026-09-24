@@ -1,5 +1,5 @@
 {
-  "model": { "providerID": "deepseek", "modelID": "deepseek-v4-flash" },
+  "model": { "providerID": "deepseek", "modelID": "deepseek-flash" },
   "daemon": { "url": "", "username": "", "password": "" },
   "accounts": [
     { "user_id": "<feishu-user-id>", "name": "YZ", "trust": "superuser" }

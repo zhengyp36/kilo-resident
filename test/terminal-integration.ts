@@ -71,14 +71,19 @@ try {
   const list = await api("/terminal")
   check("list contains session", list.sessions.some((s: { id: number }) => s.id === id))
 
-  // completion wake: bridge injects a user message into the owner session
-  await sleep(1500)
-  const msgs = await client.session.messages({ path: { id: sid }, query: { directory: DIRECTORY } })
-  const wake = (msgs.data ?? []).find((m) => m.info.role === "user" && (m.parts ?? []).some((p) => p.type === "text" && p.text.includes(`[terminal ${id}] exited`)))
+  // completion wake: bridge injects a user message into the owner session.
+  // It is deferred until the session goes idle (the reminder turn may still be running), so poll.
+  let msgs: any[] = []
+  let wake: any
+  for (let i = 0; i < 40 && !wake; i++) {
+    await sleep(300)
+    msgs = (await client.session.messages({ path: { id: sid }, query: { directory: DIRECTORY } })).data ?? []
+    wake = msgs.find((m: any) => m.info.role === "user" && (m.parts ?? []).some((p: any) => p.type === "text" && p.text.includes(`[terminal ${id}] exited`)))
+  }
   check("completion wake injected into session", !!wake, wake ? "" : "no [terminal] exited message found")
 
   // one-shot: the re-armed reminder must be cleared by completion, not fire again
-  check("no reminder after completion", remindersOf(msgs.data ?? []).length === 1, `count=${remindersOf(msgs.data ?? []).length}`)
+  check("no reminder after completion", remindersOf(msgs).length === 1, `count=${remindersOf(msgs).length}`)
 
   await api("/terminal/close", { method: "POST", body: JSON.stringify({ id }) })
 } finally {

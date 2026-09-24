@@ -34,18 +34,24 @@ export async function getMessages(client: KiloClient, sessionId: string, directo
   return r.data ?? []
 }
 
+/** Map of sessionID -> status for a directory. Idle sessions are simply absent. */
+export async function sessionStatus(client: KiloClient, directory: string): Promise<Record<string, { type?: string }>> {
+  const r = await client.session.status({ query: { directory } })
+  return (r.data ?? {}) as Record<string, { type?: string }>
+}
+
 export async function promptAsync(
   client: KiloClient,
   sessionId: string,
   directory: string,
-  model: Model,
+  model: Model | undefined,
   messageID: string,
   text: string,
 ): Promise<void> {
   await client.session.promptAsync({
     path: { id: sessionId },
     query: { directory },
-    body: { model, messageID, parts: [{ type: "text", text }] },
+    body: { ...(model ? { model } : {}), messageID, parts: [{ type: "text", text }] },
   })
 }
 

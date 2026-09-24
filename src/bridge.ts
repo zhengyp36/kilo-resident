@@ -1,5 +1,5 @@
 import { matchAccount, loadDaemon, type FeishuCreds } from "./config.ts"
-import { makeKiloClient, createSession, listSessionIds, listSessions, getMessages, promptAsync, summarize, type Model, type SessionInfo } from "./kilo.ts"
+import { makeKiloClient, createSession, listSessionIds, listSessions, getMessages, promptAsync, sessionStatus, summarize, type Model, type SessionInfo } from "./kilo.ts"
 import { createKiloClient, type KiloClient } from "@kilocode/sdk"
 import { FeishuBot, type InboundMessage } from "./feishu.ts"
 import { SessionQueue } from "./queue.ts"
@@ -49,7 +49,6 @@ interface Runtime {
   feishu: FeishuBot
   busy: boolean
   queue: SessionQueue<Inbound>
-  wakes: { messageID: string; text: string; serverUrl?: string; chatId?: string }[]
   inflight?: Inflight
   lastChatId?: string
   /** Snapshot from the last /sessions listing, so /pin <n> resolves to a stable id. */
@@ -57,6 +56,32 @@ interface Runtime {
   /** Set while becameIdle is resolving/awaiting a reply, to avoid concurrent duplicate sends. */
   resolving?: boolean
 }
+
+/** One notification-type event awaiting a wake (terminal done, timer, phone). */
+interface PendingWake {
+  id: string
+  text: string
+  serverUrl?: string
+  chatId?: string
+}
+
+/** Per-session merge buffer + dispatch state for notification-type events. */
+interface InboxEntry {
+  directory: string
+  firstAt: number
+  lastDispatchAt: number
+  dispatching: boolean
+  events: PendingWake[]
+}
+
+/** Wait this long after the first pending event before dispatching, to batch bursts. */
+const NOTIFY_DEBOUNCE_MS = 1000
+/** Dispatcher poll interval (idle gating fallback; session.idle also triggers a dispatch). */
+const DISPATCH_INTERVAL_MS = 1000
+/** Ignore session.idle right after a dispatch, while the server transitions to busy. */
+const POST_DISPATCH_COOLDOWN_MS = 1500
+/** A session stays "watched" (has an observable sink) this long after its last explicit interaction. */
+const WATCH_TTL_MS = 60 * 60 * 1000
 
 function timeAgo(ms: number): string {
   const diff = Date.now() - ms
@@ -77,11 +102,15 @@ export class Bridge {
   private readonly seenEvents = new Set<string>()
   private readonly seenInbound = new Set<string>()
   private readonly pendingPermissions = new Map<string, PendingPermission>()
+  private readonly inbox = new Map<string, InboxEntry>()
+  private readonly statusCache = new Map<string, { at: number; busy: boolean }>()
+  private readonly watched = new Map<string, { directory: string; at: number }>()
+  private dispatchTimer?: NodeJS.Timeout
+  private dispatchRunning = false
   private readonly cfg: Config
   private readonly state: State
   private readonly stateFile: string
   private readonly creds: Map<string, FeishuCreds>
-  private readonly wakeMode: "async" | "tui"
   private control?: ControlServer
   private phone?: PhoneManager
   private phoneBound?: { sessionID: string; directory: string; serverUrl?: string }
@@ -91,7 +120,6 @@ export class Bridge {
     this.state = state
     this.stateFile = stateFile
     this.creds = creds
-    this.wakeMode = cfg.wake?.mode === "tui" ? "tui" : "async"
     const daemon =
       cfg.daemon?.url
         ? { url: cfg.daemon.url, username: cfg.daemon.username, password: cfg.daemon.password }
@@ -158,6 +186,10 @@ export class Bridge {
             ? Date.now() + delaySec * 1000
             : NaN
     if (!Number.isFinite(fireAt)) throw new Error("need one of: delaySec, at (ISO), fireAt (epoch ms)")
+    this.markWatched(
+      body.sessionID != null ? String(body.sessionID) : undefined,
+      body.directory != null ? String(body.directory) : undefined,
+    )
     return this.timers.set({
       fireAt,
       title,
@@ -184,9 +216,10 @@ export class Bridge {
       const queue = new SessionQueue<Inbound>(this.cfg.queue?.maxWaitMs ?? 900_000, (item) => {
         void this.byBot.get(bot.name)?.feishu.sendText(item.chatId, "[busy] dropped an earlier message after waiting too long; please resend.")
       })
-      const rt: Runtime = { name: bot.name, directory: bot.directory, sessionId, feishu, busy: false, queue, wakes: [] }
+      const rt: Runtime = { name: bot.name, directory: bot.directory, sessionId, feishu, busy: false, queue }
       this.runtimes.set(sessionId, rt)
       this.byBot.set(bot.name, rt)
+      this.markWatched(sessionId, bot.directory)
       feishu.start()
       log("bridge", `bot ${bot.name} dir=${bot.directory} session=${sessionId}`)
     }
@@ -202,15 +235,18 @@ export class Bridge {
       set: (body) => this.setTimerFromSession(body),
       cancel: (id) => this.timers.cancel(id),
       terminal: {
-        open: (b) =>
-          this.terminals.open({
+        open: (b) => {
+          this.markWatched(b.sessionID != null ? String(b.sessionID) : undefined, b.directory != null ? String(b.directory) : undefined)
+          return this.terminals.open({
             cwd: b.cwd != null ? String(b.cwd) : undefined,
             sessionID: b.sessionID != null ? String(b.sessionID) : undefined,
             directory: b.directory != null ? String(b.directory) : undefined,
             serverUrl: b.serverUrl != null ? String(b.serverUrl) : undefined,
-          }),
-        exec: (b) =>
-          this.terminals.exec(
+          })
+        },
+        exec: (b) => {
+          this.markWatched(b.sessionID != null ? String(b.sessionID) : undefined, b.directory != null ? String(b.directory) : undefined)
+          return this.terminals.exec(
             b.id,
             String(b.command ?? ""),
             {
@@ -219,10 +255,14 @@ export class Bridge {
               serverUrl: b.serverUrl != null ? String(b.serverUrl) : undefined,
             },
             b.notifyAfterSec != null ? Number(b.notifyAfterSec) : undefined,
-          ),
+          )
+        },
         observe: (b) =>
           this.terminals.observe(b.id, b.offset != null ? Number(b.offset) : undefined, b.limit != null ? Number(b.limit) : undefined),
-        notify: (b) => this.terminals.notify(b.id, b.afterSec),
+        notify: (b) => {
+          this.markWatched(b.sessionID != null ? String(b.sessionID) : undefined, b.directory != null ? String(b.directory) : undefined)
+          return this.terminals.notify(b.id, b.afterSec)
+        },
         cancel: (b) => this.terminals.cancel(b.id),
         list: () => this.terminals.list(),
         close: (b) => this.terminals.close(b.id),
@@ -235,6 +275,12 @@ export class Bridge {
       },
     })
     this.writeControlFile(port, token)
+
+    if (this.cfg.wake?.mode === "tui") {
+      warn("bridge", "wake.mode=tui is deprecated and ignored: wakes are session-scoped (prompt_async) now")
+    }
+    this.dispatchTimer = setInterval(() => void this.dispatchTick(), DISPATCH_INTERVAL_MS)
+    this.dispatchTimer.unref?.()
 
     log("bridge", `ready (${this.byBot.size} bot(s), ${dirs.size} dir(s))`)
   }
@@ -268,7 +314,7 @@ export class Bridge {
     rt.inflight = undefined
     rt.busy = false
     rt.queue.clear()
-    rt.wakes = []
+    this.inbox.delete(old)
     this.runtimes.set(id, rt)
     return old
   }
@@ -290,6 +336,7 @@ export class Bridge {
       return
     }
     rt.lastChatId = msg.chatId
+    this.markWatched(rt.sessionId, rt.directory)
     if (!msg.text.trim()) {
       log("bridge", "ignore empty or non-text message")
       return
@@ -537,28 +584,28 @@ export class Bridge {
 
   private async becameIdle(sessionId: string): Promise<void> {
     const rt = this.runtimes.get(sessionId)
-    if (!rt || rt.resolving) return
-    if (!rt.busy && !rt.inflight) return
-    rt.resolving = true
-    try {
-      if (rt.inflight) {
-        const settled = await this.resolveReply(rt, rt.inflight)
-        if (!settled && Date.now() - rt.inflight.since < 600_000) return // turn still generating; wait for the next idle
-        if (!settled) warn("bridge", `giving up on reply for ${rt.inflight.injectedId} after 10min`)
-        rt.inflight = undefined
+    if (rt && !rt.resolving && (rt.busy || rt.inflight)) {
+      rt.resolving = true
+      try {
+        if (rt.inflight) {
+          const settled = await this.resolveReply(rt, rt.inflight)
+          if (!settled && Date.now() - rt.inflight.since < 600_000) return // turn still generating; wait for the next idle
+          if (!settled) warn("bridge", `giving up on reply for ${rt.inflight.injectedId} after 10min`)
+          rt.inflight = undefined
+        }
+        rt.busy = false
+        rt.queue.dropExpired()
+        const next = rt.queue.shift()
+        if (next) {
+          await this.inject(rt, next)
+          return
+        }
+      } finally {
+        rt.resolving = false
       }
-      rt.busy = false
-      rt.queue.dropExpired()
-      const next = rt.queue.shift()
-      if (next) {
-        await this.inject(rt, next)
-        return
-      }
-      const wake = rt.wakes.shift()
-      if (wake) await this.deliverWake(rt, wake.messageID, wake.text, wake.serverUrl, wake.chatId)
-    } finally {
-      rt.resolving = false
     }
+    // idle is the strongest signal: dispatch any pending notifications without waiting for the debounce
+    await this.tryDispatch(sessionId, true)
   }
 
   /**
@@ -705,64 +752,31 @@ export class Bridge {
   private async promptWake(sessionId: string, directory: string, messageID: string, text: string, serverUrl?: string): Promise<void> {
     const client = this.clientFor(serverUrl)
     try {
-      await promptAsync(client, sessionId, directory, this.model(), messageID, text)
+      // No explicit model: use the session's own model, so the bridge never pins a stale model id.
+      await promptAsync(client, sessionId, directory, undefined, messageID, text)
     } catch (err) {
       if (client === this.client) throw err
       warn("bridge", `wake via ${serverUrl} failed, retry via daemon: ${String(err)}`)
-      await promptAsync(this.client, sessionId, directory, this.model(), messageID, text)
+      await promptAsync(this.client, sessionId, directory, undefined, messageID, text)
     }
   }
 
   /**
    * Deliver an injected message into a session and return the user-message id used (for reply routing).
-   * In "tui" wake mode this goes through the attached TUI window (append-prompt + submit-prompt) so it
-   * renders as a normal local turn instead of a server-side prompt_async that the TUI shows as QUEUED.
+   * Session-scoped only: `prompt_async` targets one sessionID and is headless-safe. The TUI channel
+   * (`/tui/*`) is global broadcast and must not be used for wakes.
    */
   private async deliver(sessionId: string, directory: string, messageID: string, text: string, serverUrl?: string): Promise<string> {
-    if (this.wakeMode === "tui") {
-      const actual = await this.tuiDeliver(sessionId, directory, text)
-      if (actual) return actual
-      warn("bridge", `tui wake not confirmed for ${sessionId}; falling back to promptAsync`)
-    }
     await this.promptWake(sessionId, directory, messageID, text, serverUrl)
     return messageID
-  }
-
-  /** Submit text via the attached TUI; returns the created user-message id, or null if no window handled it. */
-  private async tuiDeliver(sessionId: string, directory: string, text: string): Promise<string | null> {
-    const t0 = Date.now()
-    try {
-      await this.client.tui.appendPrompt({ body: { text }, query: { directory } })
-      await this.client.tui.submitPrompt({ query: { directory } })
-    } catch (err) {
-      warn("bridge", `tui deliver failed: ${String(err)}`)
-      return null
-    }
-    for (let i = 0; i < 15; i++) {
-      await new Promise((r) => setTimeout(r, 200))
-      try {
-        const msgs = await getMessages(this.client, sessionId, directory)
-        let best: { id: string; created: number } | null = null
-        for (const m of msgs) {
-          const created = (m.info as { time?: { created?: number } }).time?.created ?? 0
-          if (created < t0 || m.info.role !== "user") continue
-          const body = m.parts.map((p) => (p.type === "text" ? p.text : "")).join("")
-          if (body === text && (!best || created > best.created)) best = { id: m.info.id, created }
-        }
-        if (best) return best.id
-      } catch {
-        // ignore transient read errors
-      }
-    }
-    return null
   }
 
   private onTerminalDone(s: TerminalSession): void {
     const status = s.cancelled
       ? "cancelled"
       : `exited code=${s.exitCode ?? "null"}${s.signal ? ` signal=${s.signal}` : ""}`
-    const tail = this.terminals.tail(s)
-    const text = `[terminal ${s.id}] ${status}${s.truncated ? " (output truncated)" : ""}\nlast output:\n${tail || "(none)"}`
+    // Pointer only: the payload stays in the terminal buffer and is pulled back with terminal_observe.
+    const text = `[terminal ${s.id}] ${status}${s.truncated ? " (output truncated)" : ""} — output via terminal_observe ${s.id}`
     log("terminal", `done id=${s.id} ${status} owner=${s.ownerSessionID ?? "-"} server=${s.ownerServerUrl ?? "-"}`)
     if (s.ownerSessionID) {
       const chatId = this.runtimes.get(s.ownerSessionID)?.lastChatId
@@ -772,7 +786,7 @@ export class Bridge {
 
   private onTerminalRemind(s: TerminalSession): void {
     const elapsed = Math.max(0, Math.round((Date.now() - (s.startedAt ?? Date.now())) / 1000))
-    const text = `[terminal ${s.id}] still running (elapsed ${elapsed}s)`
+    const text = `[terminal ${s.id}] still running (elapsed ${elapsed}s) — observe via terminal_observe ${s.id}`
     log("terminal", `reminder id=${s.id} elapsed=${elapsed}s owner=${s.ownerSessionID ?? "-"}`)
     if (s.ownerSessionID) {
       const chatId = this.runtimes.get(s.ownerSessionID)?.lastChatId
@@ -780,34 +794,154 @@ export class Bridge {
     }
   }
 
-  private wakeSession(sessionId: string, directory: string, messageID: string, text: string, serverUrl?: string, chatId?: string): void {
-    const rt = this.runtimes.get(sessionId)
-    if (!rt) {
-      void this.deliver(sessionId, directory, messageID, text, serverUrl).catch((err) =>
-        warn("bridge", `wake ${sessionId} failed: ${String(err)}`),
-      )
-      return
+  /**
+   * Queue a notification-type event (terminal done, timer, phone) for a session. Events for the same
+   * session are merged into one turn and dispatched only when the session is idle (see the dispatcher).
+   */
+  private wakeSession(
+    sessionId: string,
+    directory: string,
+    messageID: string,
+    text: string,
+    serverUrl?: string,
+    chatId?: string,
+  ): void {
+    let entry = this.inbox.get(sessionId)
+    if (!entry) {
+      entry = { directory, firstAt: Date.now(), lastDispatchAt: 0, dispatching: false, events: [] }
+      this.inbox.set(sessionId, entry)
     }
-    if (!rt.busy && !rt.inflight && rt.queue.size === 0) {
-      void this.deliverWake(rt, messageID, text, serverUrl, chatId)
-      return
-    }
-    rt.wakes.push({ messageID, text, serverUrl, chatId })
-    log("bridge", `wake queued for ${rt.name} (wakes=${rt.wakes.length})`)
+    if (directory) entry.directory = directory
+    entry.events.push({ id: messageID, text, serverUrl, chatId })
+    log("dispatch", `queued for ${sessionId} (pending=${entry.events.length})`)
+    void this.tryDispatch(sessionId, false)
   }
 
-  private async deliverWake(rt: Runtime, messageID: string, text: string, serverUrl?: string, chatId?: string): Promise<void> {
+  /** Record that a session was interacted with directly (tool call / phone / timer set), i.e. it has an observer. */
+  private markWatched(sessionId?: string, directory?: string): void {
+    if (!sessionId || sessionId === "undefined" || sessionId === "null") return
+    const prev = this.watched.get(sessionId)
+    this.watched.set(sessionId, { directory: directory ?? prev?.directory ?? "", at: Date.now() })
+  }
+
+  private isWatched(sessionId: string): boolean {
+    const w = this.watched.get(sessionId)
+    if (!w) return false
+    if (Date.now() - w.at > WATCH_TTL_MS) {
+      this.watched.delete(sessionId)
+      return false
+    }
+    return true
+  }
+
+  /** Poll-driven fallback; session.idle triggers an immediate dispatch instead of waiting for this. */
+  private async dispatchTick(): Promise<void> {
+    if (this.dispatchRunning) return
+    this.dispatchRunning = true
+    try {
+      for (const [sessionId, entry] of this.inbox) {
+        if (entry.events.length === 0) continue
+        await this.tryDispatch(sessionId, false)
+      }
+      const now = Date.now()
+      for (const [sessionId, entry] of this.inbox) {
+        if (entry.events.length === 0 && now - entry.lastDispatchAt > 300_000) this.inbox.delete(sessionId)
+      }
+    } finally {
+      this.dispatchRunning = false
+    }
+  }
+
+  /**
+   * Dispatch pending events for one session if it is idle. Gated on: debounce window, idle (from the
+   * event stream for known runtimes, or /session/status for ad-hoc sessions), and no delivery in flight.
+   */
+  private async tryDispatch(sessionId: string, idleTriggered: boolean): Promise<void> {
+    const entry = this.inbox.get(sessionId)
+    if (!entry || entry.dispatching || entry.events.length === 0) return
+    if (!idleTriggered && Date.now() - entry.firstAt < NOTIFY_DEBOUNCE_MS) return
+    if (Date.now() - entry.lastDispatchAt < POST_DISPATCH_COOLDOWN_MS) return
+    // Claim the batch synchronously, before any await, so concurrent callers cannot splice the same
+    // events (the status check below yields).
+    entry.dispatching = true
+    try {
+      const rt = this.runtimes.get(sessionId)
+      if (rt) {
+        if (rt.resolving || rt.busy || rt.inflight || rt.queue.size > 0) return
+      } else if (await this.sessionBusy(sessionId, entry.directory)) {
+        return
+      }
+      const batch = entry.events.splice(0, entry.events.length)
+      if (batch.length === 0) return
+      entry.lastDispatchAt = Date.now()
+      await this.dispatchBatch(sessionId, entry.directory, batch)
+    } finally {
+      entry.dispatching = false
+    }
+  }
+
+  private async sessionBusy(sessionId: string, directory: string): Promise<boolean> {
+    const cached = this.statusCache.get(sessionId)
+    if (cached && Date.now() - cached.at < 900) return cached.busy
+    try {
+      const status = await sessionStatus(this.client, directory)
+      const type = status[sessionId]?.type
+      const busy = type === "busy" || type === "retry"
+      this.statusCache.set(sessionId, { at: Date.now(), busy })
+      return busy
+    } catch (err) {
+      warn("dispatch", `status check failed for ${sessionId}: ${String(err)}`)
+      return false
+    }
+  }
+
+  private async dispatchBatch(sessionId: string, directory: string, batch: PendingWake[]): Promise<void> {
+    const chatId = batch.find((b) => b.chatId)?.chatId
+    const serverUrl = batch.find((b) => b.serverUrl)?.serverUrl
+    const sink = Boolean(chatId) || this.isWatched(sessionId)
+    const body = batch.map((b) => b.text).join("\n\n")
+    const text = batch.length === 1 ? body : `[${batch.length} 条待处理事件]\n\n${body}`
+
+    if (!sink) {
+      log("dispatch", `no sink for ${sessionId}; suppressing ${batch.length} event(s)`)
+      this.notifyYz(`[kilo-resident] 会话 ${sessionId} 无观察出口，已压住 ${batch.length} 条事件：\n${body.slice(0, 500)}`)
+      return
+    }
+
+    const messageID = batch[0].id
+    const rt = this.runtimes.get(sessionId)
+    if (!rt) {
+      try {
+        await this.deliver(sessionId, directory, messageID, text, serverUrl)
+        log("dispatch", `woke ${sessionId} with ${batch.length} event(s)`)
+      } catch (err) {
+        warn("dispatch", `wake failed for ${sessionId}: ${String(err)}`)
+      }
+      return
+    }
     rt.busy = true
     if (chatId) rt.inflight = { injectedId: messageID, chatId, since: Date.now() }
     try {
       const actualId = await this.deliver(rt.sessionId, rt.directory, messageID, text, serverUrl)
       if (rt.inflight) rt.inflight.injectedId = actualId
-      log("bridge", `woke ${rt.sessionId} (${actualId})`)
+      log("dispatch", `woke ${rt.sessionId} (${actualId}) with ${batch.length} event(s)`)
     } catch (err) {
       rt.busy = false
       rt.inflight = undefined
-      warn("bridge", `wake failed: ${String(err)}`)
+      warn("dispatch", `wake failed for ${rt.sessionId}: ${String(err)}`)
     }
+  }
+
+  /** Notify YZ on Feishu when a session has no observable sink (AC4). */
+  private notifyYz(text: string): void {
+    const bot = this.cfg.bots.find((b) => b.notifyChat) ?? this.cfg.bots[0]
+    const rt = bot ? this.byBot.get(bot.name) : undefined
+    const chat = rt?.lastChatId ?? bot?.notifyChat
+    if (!rt || !chat) {
+      warn("dispatch", `cannot notify YZ (no feishu chat): ${text}`)
+      return
+    }
+    void rt.feishu.sendText(chat, text)
   }
 
   // ---------- phone (agent <-> Kilo channel) ----------
@@ -826,6 +960,7 @@ export class Bridge {
     if (!sessionID) throw new Error("sessionID required")
     const serverUrl = b.serverUrl != null ? String(b.serverUrl) : undefined
     this.phoneBound = { sessionID, directory, serverUrl }
+    this.markWatched(sessionID, directory)
     const url = await this.ensurePhone().open()
     return { ok: true, url, number: this.cfg.phone?.number }
   }
@@ -854,9 +989,7 @@ export class Bridge {
     const mid = `msg_phone_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
     log("phone", `inbound ${p.from} round=${p.round ?? "-"} -> ${bound.sessionID}`)
     // No auto-reply: inject only. Kilo decides whether to call phone_send.
-    void this.deliver(bound.sessionID, bound.directory, mid, text, bound.serverUrl).catch((err) =>
-      warn("phone", `inject failed: ${String(err)}`),
-    )
+    this.wakeSession(bound.sessionID, bound.directory, mid, text, bound.serverUrl)
   }
 
   // ---------- timers ----------
@@ -871,14 +1004,12 @@ export class Bridge {
       const rt = this.byBot.get(a)
       if (rt && b) void rt.feishu.sendText(b, text)
       else log("timer", `fired but bot ${a} not found: ${text}`)
-      if (rt && !rt.busy) {
-        void this.deliver(rt.sessionId, rt.directory, `msg_timer_${t.id}`, wake).catch(() => {})
-      }
+      if (rt) this.wakeSession(rt.sessionId, rt.directory, `msg_timer_${t.id}`, wake, undefined, b)
       return
     }
     if (kind === "session") {
-      void this.deliver(b, a, `msg_timer_${t.id}`, wake).catch(() => {})
-      log("timer", `woke session ${b}: ${text}`)
+      this.wakeSession(b, a, `msg_timer_${t.id}`, wake)
+      log("timer", `queued wake for session ${b}: ${text}`)
       return
     }
     log("timer", `fired without a delivery channel: ${text}`)
