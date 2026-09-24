@@ -64,11 +64,17 @@ export const KiloResidentTerminal: Plugin = async ({ serverUrl }) => {
         args: {
           id: tool.schema.number().describe("terminal session id"),
           command: tool.schema.string().describe("shell command to run"),
+          notifyAfterSec: tool.schema
+            .number()
+            .optional()
+            .describe(
+              "one-shot reminder delay in seconds: wake this session once after N seconds if the command is still running (default 0 = no reminder). Re-arm it after each reminder via terminal_notify.",
+            ),
         },
         execute: async (args, context) => {
           const j = await call("/terminal/exec", {
             method: "POST",
-            body: JSON.stringify({ id: args.id, command: args.command, sessionID: context.sessionID, directory: context.directory, serverUrl: server }),
+            body: JSON.stringify({ id: args.id, command: args.command, notifyAfterSec: args.notifyAfterSec, sessionID: context.sessionID, directory: context.directory, serverUrl: server }),
           })
           const t = j.terminal as { ok: boolean; id: number; reason?: string }
           if (!t.ok) return `exec rejected: ${t.reason}`
@@ -92,6 +98,24 @@ export const KiloResidentTerminal: Plugin = async ({ serverUrl }) => {
           const t = j.terminal as any
           if (!t.ok) return `observe failed: ${t.reason}`
           return fmtObserve(t)
+        },
+      }),
+
+      terminal_notify: tool({
+        description:
+          "Set or replace a one-shot reminder for the command running in a terminal session: wake this session once after afterSec seconds if the command is still running. Use 0 to cancel a pending reminder. The reminder fires at most once; re-arm it after each wake if you want another.",
+        args: {
+          id: tool.schema.number().describe("terminal session id"),
+          afterSec: tool.schema.number().describe("seconds until the next reminder; 0 cancels the pending reminder"),
+        },
+        execute: async (args) => {
+          const j = await call("/terminal/notify", {
+            method: "POST",
+            body: JSON.stringify({ id: args.id, afterSec: args.afterSec }),
+          })
+          const t = j.terminal as { ok: boolean; id: number; afterSec?: number; reason?: string }
+          if (!t.ok) return `notify rejected: ${t.reason}`
+          return t.afterSec ? `terminal ${t.id} will remind in ${t.afterSec}s` : `terminal ${t.id} reminder cleared`
         },
       }),
 

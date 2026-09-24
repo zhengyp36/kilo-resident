@@ -5,6 +5,7 @@ export interface TerminalHandlers {
   open(body: Record<string, unknown>): unknown
   exec(body: Record<string, unknown>): unknown
   observe(body: Record<string, unknown>): unknown
+  notify(body: Record<string, unknown>): unknown
   cancel(body: Record<string, unknown>): unknown
   list(): unknown
   close(body: Record<string, unknown>): unknown
@@ -112,6 +113,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, token: string, 
         if (op === "open") return send(res, 200, { terminal: await t.open(body) })
         if (op === "exec") return send(res, 200, { terminal: await t.exec(body) })
         if (op === "observe") return send(res, 200, { terminal: await t.observe(body) })
+        if (op === "notify") return send(res, 200, { terminal: await t.notify(body) })
         if (op === "cancel") return send(res, 200, { terminal: await t.cancel(body) })
         if (op === "close") return send(res, 200, { terminal: await t.close(body) })
         send(res, 404, { error: `unknown terminal op: ${op}` })

@@ -22,6 +22,7 @@ export interface TerminalSession {
   ownerServerUrl?: string
   startedAt?: number
   endedAt?: number
+  notifyTimer?: NodeJS.Timeout
 }
 
 export interface TerminalView {
@@ -41,6 +42,7 @@ export interface TerminalObserve extends TerminalView {
 export interface TerminalManagerOptions {
   defaultCwd: string
   onDone: (session: TerminalSession) => void
+  onRemind?: (session: TerminalSession) => void
   maxOutput?: number
   defaultObserveLimit?: number
   cancelGraceMs?: number
@@ -100,7 +102,7 @@ export class TerminalManager {
     return { ok: true, id: session.id, cwd: session.cwd }
   }
 
-  exec(id: unknown, command: string, owner?: { sessionID?: string; directory?: string; serverUrl?: string }): { ok: boolean; id?: number; started?: boolean; reason?: string } {
+  exec(id: unknown, command: string, owner?: { sessionID?: string; directory?: string; serverUrl?: string }, notifyAfterSec?: number): { ok: boolean; id?: number; started?: boolean; reason?: string } {
     const { session, error } = this.resolve(id)
     if (error || !session) return { ok: false, reason: error }
     if (session.state === "busy") return { ok: false, reason: "busy" }
@@ -141,7 +143,18 @@ export class TerminalManager {
     })
     child.on("close", (code, signal) => this.finish(session, child, code, signal))
 
+    this.armNotify(session, notifyAfterSec)
     return { ok: true, id: session.id, started: true }
+  }
+
+  notify(id: unknown, afterSec: unknown): { ok: boolean; id?: number; afterSec?: number; reason?: string } {
+    const { session, error } = this.resolve(id)
+    if (error || !session) return { ok: false, reason: error }
+    if (session.state !== "busy") return { ok: false, reason: session.state }
+    const sec = Number(afterSec)
+    if (!Number.isFinite(sec) || sec < 0) return { ok: false, reason: "invalid afterSec" }
+    this.armNotify(session, sec)
+    return { ok: true, id: session.id, afterSec: sec > 0 ? sec : 0 }
   }
 
   observe(id: unknown, offset?: number, limit?: number): { ok: boolean; reason?: string } & Partial<TerminalObserve> {
@@ -227,9 +240,28 @@ export class TerminalManager {
     }
   }
 
+  private armNotify(session: TerminalSession, afterSec: unknown): void {
+    if (session.notifyTimer) {
+      clearTimeout(session.notifyTimer)
+      session.notifyTimer = undefined
+    }
+    const sec = Number(afterSec)
+    if (!Number.isFinite(sec) || sec <= 0) return
+    const handle = setTimeout(() => {
+      session.notifyTimer = undefined
+      this.opts.onRemind?.(session)
+    }, sec * 1000)
+    handle.unref?.()
+    session.notifyTimer = handle
+  }
+
   private finish(session: TerminalSession, child: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
     if (session.proc !== child) return
     session.proc = undefined
+    if (session.notifyTimer) {
+      clearTimeout(session.notifyTimer)
+      session.notifyTimer = undefined
+    }
     session.exitCode = code
     session.signal = signal
     session.endedAt = Date.now()

@@ -111,6 +111,7 @@ export class Bridge {
       maxOutput: cfg.terminal?.maxOutput,
       defaultObserveLimit: cfg.terminal?.defaultObserveLimit,
       onDone: (s) => this.onTerminalDone(s),
+      onRemind: (s) => this.onTerminalRemind(s),
     })
   }
 
@@ -209,13 +210,19 @@ export class Bridge {
             serverUrl: b.serverUrl != null ? String(b.serverUrl) : undefined,
           }),
         exec: (b) =>
-          this.terminals.exec(b.id, String(b.command ?? ""), {
-            sessionID: b.sessionID != null ? String(b.sessionID) : undefined,
-            directory: b.directory != null ? String(b.directory) : undefined,
-            serverUrl: b.serverUrl != null ? String(b.serverUrl) : undefined,
-          }),
+          this.terminals.exec(
+            b.id,
+            String(b.command ?? ""),
+            {
+              sessionID: b.sessionID != null ? String(b.sessionID) : undefined,
+              directory: b.directory != null ? String(b.directory) : undefined,
+              serverUrl: b.serverUrl != null ? String(b.serverUrl) : undefined,
+            },
+            b.notifyAfterSec != null ? Number(b.notifyAfterSec) : undefined,
+          ),
         observe: (b) =>
           this.terminals.observe(b.id, b.offset != null ? Number(b.offset) : undefined, b.limit != null ? Number(b.limit) : undefined),
+        notify: (b) => this.terminals.notify(b.id, b.afterSec),
         cancel: (b) => this.terminals.cancel(b.id),
         list: () => this.terminals.list(),
         close: (b) => this.terminals.close(b.id),
@@ -760,6 +767,16 @@ export class Bridge {
     if (s.ownerSessionID) {
       const chatId = this.runtimes.get(s.ownerSessionID)?.lastChatId
       this.wakeSession(s.ownerSessionID, s.ownerDirectory ?? "", `msg_terminal_${s.id}_${Date.now().toString(36)}`, text, s.ownerServerUrl, chatId)
+    }
+  }
+
+  private onTerminalRemind(s: TerminalSession): void {
+    const elapsed = Math.max(0, Math.round((Date.now() - (s.startedAt ?? Date.now())) / 1000))
+    const text = `[terminal ${s.id}] still running (elapsed ${elapsed}s)`
+    log("terminal", `reminder id=${s.id} elapsed=${elapsed}s owner=${s.ownerSessionID ?? "-"}`)
+    if (s.ownerSessionID) {
+      const chatId = this.runtimes.get(s.ownerSessionID)?.lastChatId
+      this.wakeSession(s.ownerSessionID, s.ownerDirectory ?? "", `msg_terminal_${s.id}_r_${Date.now().toString(36)}`, text, s.ownerServerUrl, chatId)
     }
   }
 

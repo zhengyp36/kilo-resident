@@ -37,17 +37,32 @@ try {
 
   const exec = await api("/terminal/exec", {
     method: "POST",
-    body: JSON.stringify({ id, command: "for i in 1 2 3; do echo line$i; sleep 0.4; done", sessionID: sid, directory: DIRECTORY }),
+    body: JSON.stringify({ id, command: "for i in 1 2 3 4 5; do echo line$i; sleep 0.4; done", sessionID: sid, directory: DIRECTORY, notifyAfterSec: 0.5 }),
   })
   check("exec started", exec.terminal.ok === true && exec.terminal.started === true)
 
   const busy = await api("/terminal/exec", { method: "POST", body: JSON.stringify({ id, command: "echo no", sessionID: sid, directory: DIRECTORY }) })
   check("busy rejected", busy.terminal.ok === false && busy.terminal.reason === "busy")
 
-  await sleep(500)
+  await sleep(900)
   const mid = await api("/terminal/observe", { method: "POST", body: JSON.stringify({ id }) })
   check("observe busy", mid.terminal.state === "busy", JSON.stringify(mid.terminal.output))
   check("observe saw line1", String(mid.terminal.output).includes("line1"))
+
+  // control route: re-arm the reminder while busy
+  const rn = await api("/terminal/notify", { method: "POST", body: JSON.stringify({ id, afterSec: 3 }) })
+  check("notify route re-arms while busy", rn.terminal.ok === true && rn.terminal.afterSec === 3)
+
+  // reminder wake: the 0.5s one-shot nudge may take a moment to land, so poll
+  const remindersOf = (data: any[]) =>
+    data.filter((m) => m.info.role === "user" && (m.parts ?? []).some((p: any) => p.type === "text" && p.text.includes(`[terminal ${id}] still running`)))
+  let reminders: any[] = []
+  for (let i = 0; i < 20 && reminders.length === 0; i++) {
+    await sleep(150)
+    const rmsgs = await client.session.messages({ path: { id: sid }, query: { directory: DIRECTORY } })
+    reminders = remindersOf(rmsgs.data ?? [])
+  }
+  check("reminder wake injected", reminders.length === 1, `count=${reminders.length}`)
 
   await sleep(2000)
   const after = await api("/terminal/observe", { method: "POST", body: JSON.stringify({ id }) })
@@ -59,8 +74,11 @@ try {
   // completion wake: bridge injects a user message into the owner session
   await sleep(1500)
   const msgs = await client.session.messages({ path: { id: sid }, query: { directory: DIRECTORY } })
-  const wake = (msgs.data ?? []).find((m) => m.info.role === "user" && (m.parts ?? []).some((p) => p.type === "text" && p.text.includes(`[terminal ${id}]`)))
-  check("completion wake injected into session", !!wake, wake ? "" : "no [terminal] user message found")
+  const wake = (msgs.data ?? []).find((m) => m.info.role === "user" && (m.parts ?? []).some((p) => p.type === "text" && p.text.includes(`[terminal ${id}] exited`)))
+  check("completion wake injected into session", !!wake, wake ? "" : "no [terminal] exited message found")
+
+  // one-shot: the re-armed reminder must be cleared by completion, not fire again
+  check("no reminder after completion", remindersOf(msgs.data ?? []).length === 1, `count=${remindersOf(msgs.data ?? []).length}`)
 
   await api("/terminal/close", { method: "POST", body: JSON.stringify({ id }) })
 } finally {
