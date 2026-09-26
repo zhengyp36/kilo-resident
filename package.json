@@ -18,6 +18,8 @@
     "typecheck": "tsc --noEmit",
     "test:roundtrip": "node test/roundtrip.ts",
     "test:terminal": "node test/terminal.ts",
+    "test:terminal-isolation": "node test/terminal-isolation.ts",
+    "test:session-isolation": "node test/session-isolation.ts",
     "test:permission": "node test/permission.ts",
     "test:permission-retry": "node test/permission-retry.ts",
     "test:permission-notify": "node test/permission-notify.ts",

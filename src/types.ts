@@ -28,6 +28,7 @@ export interface Config {
   bots: BotConfig[]
   queue?: { maxWaitMs?: number }
   timers?: { maxActive?: number; minIntervalSec?: number }
+  contextWatch?: { maxActive?: number; intervalSec?: number; minIntervalSec?: number }
   terminal?: { maxOutput?: number; defaultObserveLimit?: number }
   /** Command/tool whitelist for auto-approving permission.asked. Non-matching requests are forwarded to Feishu for manual approval. */
   permissions?: { allow?: PermissionRule[]; approvalTimeoutSec?: number; maxRetries?: number }
@@ -50,8 +51,28 @@ export interface TimerRecord {
   firedAt?: number
 }
 
+export interface ContextWatchRecord {
+  id: string
+  sessionID: string
+  directory: string
+  /** Token threshold (absolute), not a percentage. */
+  threshold: number
+  /** Notification body the session supplied when starting the watch. */
+  message: string
+  intervalSec: number
+  /** Same shape as TimerRecord.origin: "feishu:<bot>|<chatId>" or "session:<dir>|<sessionID>". */
+  origin: string
+  status: "watching" | "fired" | "cancelled" | "closed"
+  createdAt: number
+  nextCheckAt: number
+  lastCheckAt?: number
+  lastTokens?: number
+  firedAt?: number
+}
+
 export interface State {
   sessions: Record<string, string>
   timers: TimerRecord[]
+  contextWatches: ContextWatchRecord[]
   controlToken?: string
 }

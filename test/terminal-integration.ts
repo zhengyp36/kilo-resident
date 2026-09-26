@@ -45,12 +45,12 @@ try {
   check("busy rejected", busy.terminal.ok === false && busy.terminal.reason === "busy")
 
   await sleep(900)
-  const mid = await api("/terminal/observe", { method: "POST", body: JSON.stringify({ id }) })
+  const mid = await api("/terminal/observe", { method: "POST", body: JSON.stringify({ id, sessionID: sid }) })
   check("observe busy", mid.terminal.state === "busy", JSON.stringify(mid.terminal.output))
   check("observe saw line1", String(mid.terminal.output).includes("line1"))
 
   // control route: re-arm the reminder while busy
-  const rn = await api("/terminal/notify", { method: "POST", body: JSON.stringify({ id, afterSec: 3 }) })
+  const rn = await api("/terminal/notify", { method: "POST", body: JSON.stringify({ id, afterSec: 3, sessionID: sid }) })
   check("notify route re-arms while busy", rn.terminal.ok === true && rn.terminal.afterSec === 3)
 
   // reminder wake: the 0.5s one-shot nudge may take a moment to land, so poll
@@ -65,10 +65,10 @@ try {
   check("reminder wake injected", reminders.length === 1, `count=${reminders.length}`)
 
   await sleep(2000)
-  const after = await api("/terminal/observe", { method: "POST", body: JSON.stringify({ id }) })
+  const after = await api("/terminal/observe", { method: "POST", body: JSON.stringify({ id, sessionID: sid }) })
   check("observe idle+0", after.terminal.state === "idle" && after.terminal.exitCode === 0, JSON.stringify(after.terminal.output))
 
-  const list = await api("/terminal")
+  const list = await api(`/terminal?sessionID=${sid}`)
   check("list contains session", list.sessions.some((s: { id: number }) => s.id === id))
 
   // completion wake: bridge injects a user message into the owner session.
@@ -85,7 +85,7 @@ try {
   // one-shot: the re-armed reminder must be cleared by completion, not fire again
   check("no reminder after completion", remindersOf(msgs).length === 1, `count=${remindersOf(msgs).length}`)
 
-  await api("/terminal/close", { method: "POST", body: JSON.stringify({ id }) })
+  await api("/terminal/close", { method: "POST", body: JSON.stringify({ id, sessionID: sid }) })
 } finally {
   await client.session.delete({ path: { id: sid }, query: { directory: DIRECTORY } }).catch(() => {})
 }

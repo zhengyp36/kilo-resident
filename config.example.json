@@ -13,6 +13,7 @@
   ],
   "queue": { "maxWaitMs": 900000 },
   "timers": { "maxActive": 20, "minIntervalSec": 10 },
+  "contextWatch": { "maxActive": 10, "intervalSec": 60, "minIntervalSec": 15 },
   "terminal": { "maxOutput": 262144, "defaultObserveLimit": 8192 },
   "permissions": {
     "allow": [

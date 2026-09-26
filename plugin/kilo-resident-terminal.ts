@@ -90,10 +90,10 @@ export const KiloResidentTerminal: Plugin = async ({ serverUrl }) => {
           offset: tool.schema.number().optional().describe("byte offset to read history from (omit to read new output)"),
           limit: tool.schema.number().optional().describe("max bytes to read"),
         },
-        execute: async (args) => {
+        execute: async (args, context) => {
           const j = await call("/terminal/observe", {
             method: "POST",
-            body: JSON.stringify({ id: args.id, offset: args.offset, limit: args.limit }),
+            body: JSON.stringify({ id: args.id, offset: args.offset, limit: args.limit, sessionID: context.sessionID }),
           })
           const t = j.terminal as any
           if (!t.ok) return `observe failed: ${t.reason}`
@@ -108,10 +108,10 @@ export const KiloResidentTerminal: Plugin = async ({ serverUrl }) => {
           id: tool.schema.number().describe("terminal session id"),
           afterSec: tool.schema.number().describe("seconds until the next reminder; 0 cancels the pending reminder"),
         },
-        execute: async (args) => {
+        execute: async (args, context) => {
           const j = await call("/terminal/notify", {
             method: "POST",
-            body: JSON.stringify({ id: args.id, afterSec: args.afterSec }),
+            body: JSON.stringify({ id: args.id, afterSec: args.afterSec, sessionID: context.sessionID }),
           })
           const t = j.terminal as { ok: boolean; id: number; afterSec?: number; reason?: string }
           if (!t.ok) return `notify rejected: ${t.reason}`
@@ -122,8 +122,8 @@ export const KiloResidentTerminal: Plugin = async ({ serverUrl }) => {
       terminal_cancel: tool({
         description: "Cancel the command currently running in a terminal session (SIGTERM to the process group, then SIGKILL). Fires the completion event.",
         args: { id: tool.schema.number().describe("terminal session id") },
-        execute: async (args) => {
-          const j = await call("/terminal/cancel", { method: "POST", body: JSON.stringify({ id: args.id }) })
+        execute: async (args, context) => {
+          const j = await call("/terminal/cancel", { method: "POST", body: JSON.stringify({ id: args.id, sessionID: context.sessionID }) })
           const t = j.terminal as { ok: boolean; id: number; state: string; reason?: string }
           if (!t.ok) return `cancel failed: ${t.reason}`
           return `terminal ${t.id} state=${t.state}`
@@ -133,8 +133,8 @@ export const KiloResidentTerminal: Plugin = async ({ serverUrl }) => {
       terminal_list: tool({
         description: "List terminal sessions and their state.",
         args: {},
-        execute: async () => {
-          const j = await call("/terminal")
+        execute: async (_args, context) => {
+          const j = await call(`/terminal?sessionID=${encodeURIComponent(context.sessionID)}`)
           const list = (j.sessions ?? []) as any[]
           if (list.length === 0) return "No terminal sessions."
           return list
@@ -146,8 +146,8 @@ export const KiloResidentTerminal: Plugin = async ({ serverUrl }) => {
       terminal_close: tool({
         description: "Close a terminal session (cancels first if busy).",
         args: { id: tool.schema.number().describe("terminal session id") },
-        execute: async (args) => {
-          const j = await call("/terminal/close", { method: "POST", body: JSON.stringify({ id: args.id }) })
+        execute: async (args, context) => {
+          const j = await call("/terminal/close", { method: "POST", body: JSON.stringify({ id: args.id, sessionID: context.sessionID }) })
           const t = j.terminal as { ok: boolean; id: number; state: string; reason?: string }
           if (!t.ok) return `close failed: ${t.reason}`
           return `terminal ${t.id} closed`

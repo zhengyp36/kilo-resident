@@ -74,11 +74,15 @@ export class TerminalManager {
     return this.opts.cancelGraceMs ?? 2000
   }
 
-  private resolve(id: unknown): { session?: TerminalSession; error?: string } {
+  private resolve(id: unknown, caller?: string): { session?: TerminalSession; error?: string } {
     const sid = Number(id)
     if (!Number.isInteger(sid)) return { error: "invalid id" }
     const session = this.sessions.get(sid)
     if (!session) return { error: "unknown session" }
+    // Session isolation: a terminal owned by one session is invisible/untouchable from another.
+    // Callers that do not identify a session (legacy control clients) keep the old unrestricted
+    // behavior, so live sessions using the pre-isolation plugin are not broken before reload.
+    if (caller !== undefined && session.ownerSessionID && session.ownerSessionID !== caller) return { error: "not yours" }
     return { session }
   }
 
@@ -103,7 +107,7 @@ export class TerminalManager {
   }
 
   exec(id: unknown, command: string, owner?: { sessionID?: string; directory?: string; serverUrl?: string }, notifyAfterSec?: number): { ok: boolean; id?: number; started?: boolean; reason?: string } {
-    const { session, error } = this.resolve(id)
+    const { session, error } = this.resolve(id, owner?.sessionID)
     if (error || !session) return { ok: false, reason: error }
     if (session.state === "busy") return { ok: false, reason: "busy" }
     if (session.state === "exited") return { ok: false, reason: "exited" }
@@ -147,8 +151,8 @@ export class TerminalManager {
     return { ok: true, id: session.id, started: true }
   }
 
-  notify(id: unknown, afterSec: unknown): { ok: boolean; id?: number; afterSec?: number; reason?: string } {
-    const { session, error } = this.resolve(id)
+  notify(id: unknown, afterSec: unknown, caller?: string): { ok: boolean; id?: number; afterSec?: number; reason?: string } {
+    const { session, error } = this.resolve(id, caller)
     if (error || !session) return { ok: false, reason: error }
     if (session.state !== "busy") return { ok: false, reason: session.state }
     const sec = Number(afterSec)
@@ -157,8 +161,8 @@ export class TerminalManager {
     return { ok: true, id: session.id, afterSec: sec > 0 ? sec : 0 }
   }
 
-  observe(id: unknown, offset?: number, limit?: number): { ok: boolean; reason?: string } & Partial<TerminalObserve> {
-    const { session, error } = this.resolve(id)
+  observe(id: unknown, offset?: number, limit?: number, caller?: string): { ok: boolean; reason?: string } & Partial<TerminalObserve> {
+    const { session, error } = this.resolve(id, caller)
     if (error || !session) return { ok: false, reason: error }
     const all = Buffer.concat(session.chunks)
     let start: number
@@ -185,8 +189,8 @@ export class TerminalManager {
     }
   }
 
-  async cancel(id: unknown): Promise<{ ok: boolean; id?: number; state?: TerminalState; reason?: string }> {
-    const { session, error } = this.resolve(id)
+  async cancel(id: unknown, caller?: string): Promise<{ ok: boolean; id?: number; state?: TerminalState; reason?: string }> {
+    const { session, error } = this.resolve(id, caller)
     if (error || !session) return { ok: false, reason: error }
     if (session.state !== "busy" || !session.proc || session.proc.exitCode !== null) {
       return { ok: true, id: session.id, state: session.state }
@@ -201,14 +205,17 @@ export class TerminalManager {
     return { ok: true, id: session.id, state: session.state }
   }
 
-  list(): TerminalView[] {
-    return [...this.sessions.values()].map((s) => this.view(s))
+  list(caller?: string): TerminalView[] {
+    const all = [...this.sessions.values()]
+    // Identified sessions see only their own; unidentified (legacy) callers see everything.
+    const visible = caller === undefined ? all : all.filter((s) => s.ownerSessionID === caller)
+    return visible.map((s) => this.view(s))
   }
 
-  async close(id: unknown): Promise<{ ok: boolean; id?: number; state?: TerminalState; reason?: string }> {
-    const { session, error } = this.resolve(id)
+  async close(id: unknown, caller?: string): Promise<{ ok: boolean; id?: number; state?: TerminalState; reason?: string }> {
+    const { session, error } = this.resolve(id, caller)
     if (error || !session) return { ok: false, reason: error }
-    if (session.state === "busy") await this.cancel(id)
+    if (session.state === "busy") await this.cancel(id, caller)
     session.state = "exited"
     return { ok: true, id: session.id, state: session.state }
   }

@@ -4,6 +4,7 @@ import { createKiloClient, type KiloClient } from "@kilocode/sdk"
 import { FeishuBot, type InboundMessage } from "./feishu.ts"
 import { SessionQueue } from "./queue.ts"
 import { TimerStore } from "./timer.ts"
+import { ContextWatchStore } from "./context-watch.ts"
 import { TerminalManager, type TerminalSession } from "./terminal.ts"
 import { PhoneManager, formatInbound, type PhoneInbound } from "./phone.ts"
 import { matchesAllow } from "./permission.ts"
@@ -14,7 +15,7 @@ import { mkdirSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { randomBytes } from "node:crypto"
-import type { Config, State, Trust, TimerRecord } from "./types.ts"
+import type { Config, State, Trust, TimerRecord, ContextWatchRecord } from "./types.ts"
 
 interface Inbound extends InboundMessage {
   trust: Trust
@@ -98,6 +99,7 @@ export class Bridge {
   private readonly runtimes = new Map<string, Runtime>()
   private readonly byBot = new Map<string, Runtime>()
   private readonly timers: TimerStore
+  private readonly contextWatches: ContextWatchStore
   private readonly terminals: TerminalManager
   private readonly seenEvents = new Set<string>()
   private readonly seenInbound = new Set<string>()
@@ -134,6 +136,18 @@ export class Bridge {
       persist: () => saveState(this.stateFile, this.state),
     })
 
+    this.contextWatches = new ContextWatchStore(
+      state.contextWatches,
+      (w, tokens) => this.onContextFire(w, tokens),
+      (w) => this.probeContext(w),
+      {
+        maxActive: cfg.contextWatch?.maxActive ?? 10,
+        defaultIntervalSec: cfg.contextWatch?.intervalSec ?? 60,
+        minIntervalSec: cfg.contextWatch?.minIntervalSec ?? 15,
+        persist: () => saveState(this.stateFile, this.state),
+      },
+    )
+
     this.terminals = new TerminalManager({
       defaultCwd: process.cwd(),
       maxOutput: cfg.terminal?.maxOutput,
@@ -143,16 +157,36 @@ export class Bridge {
     })
   }
 
-  listTimers() {
-    return this.timers.list()
+  listTimers(sessionID?: string) {
+    // Identified sessions see only their own timers; unidentified (legacy) callers see everything.
+    if (sessionID === undefined) return this.timers.list()
+    return this.timers.list().filter((t) => this.timerOwner(t) === sessionID)
   }
 
   setTimer(input: { fireAt: number; title: string; notes?: string; origin: string }) {
     return this.timers.set(input)
   }
 
-  cancelTimer(id: string) {
+  cancelTimer(id: string, sessionID?: string) {
+    if (sessionID) {
+      const t = this.timers.list().find((x) => x.id === id && x.status === "pending")
+      if (t && this.timerOwner(t) !== sessionID) return null
+    }
     return this.timers.cancel(id)
+  }
+
+  listContextWatches(sessionID?: string) {
+    // Identified sessions see only their own watches; unidentified (legacy) callers see everything.
+    if (sessionID === undefined) return this.contextWatches.list()
+    return this.contextWatches.list().filter((w) => this.watchOwner(w) === sessionID)
+  }
+
+  cancelContextWatch(id: string, sessionID?: string) {
+    if (sessionID) {
+      const w = this.contextWatches.list().find((x) => x.id === id && x.status === "watching")
+      if (w && this.watchOwner(w) !== sessionID) return null
+    }
+    return this.contextWatches.cancel(id)
   }
 
   private ensureToken(): string {
@@ -170,6 +204,22 @@ export class Bridge {
     if (rt) return `session|${rt.directory}|${sessionID}`
     if (sessionID) return `session|${directory ?? ""}|${sessionID}`
     return "window"
+  }
+
+  /** Session that owns a timer, derived from its origin (session timers) or bot binding (feishu timers). */
+  private timerOwner(t: TimerRecord): string | undefined {
+    return this.originOwner(t.origin)
+  }
+
+  private watchOwner(w: ContextWatchRecord): string | undefined {
+    return this.originOwner(w.origin)
+  }
+
+  private originOwner(origin: string): string | undefined {
+    const [kind, a, b] = String(origin ?? "").split("|")
+    if (kind === "session") return b
+    if (kind === "feishu") return this.byBot.get(a)?.sessionId
+    return undefined
   }
 
   private setTimerFromSession(body: Record<string, unknown>): TimerRecord {
@@ -195,6 +245,25 @@ export class Bridge {
       title,
       notes: body.notes != null ? String(body.notes) : undefined,
       origin: this.originFor(String(body.sessionID ?? ""), body.directory != null ? String(body.directory) : undefined),
+    })
+  }
+
+  private setContextWatchFromSession(body: Record<string, unknown>): ContextWatchRecord {
+    const sessionID = String(body.sessionID ?? "")
+    if (!sessionID || sessionID === "undefined" || sessionID === "null") throw new Error("sessionID required")
+    const message = String(body.message ?? "").trim()
+    if (!message) throw new Error("message required")
+    const thresholdK = Number(body.thresholdK ?? body.threshold ?? NaN)
+    if (!Number.isFinite(thresholdK) || thresholdK <= 0) throw new Error("thresholdK required (in K tokens)")
+    const directory = body.directory != null ? String(body.directory) : ""
+    this.markWatched(sessionID, directory)
+    return this.contextWatches.set({
+      sessionID,
+      directory,
+      threshold: Math.round(thresholdK * 1000),
+      message,
+      intervalSec: body.intervalSec != null ? Number(body.intervalSec) : undefined,
+      origin: this.originFor(sessionID, directory),
     })
   }
 
@@ -227,13 +296,19 @@ export class Bridge {
     const dirs = new Set([...this.byBot.values()].map((r) => r.directory))
     for (const dir of dirs) void this.subscribeEvents(dir)
     this.timers.start()
+    this.contextWatches.start()
 
     const port = this.cfg.control?.port ?? 4180
     const token = this.ensureToken()
     this.control = startControl(port, token, {
-      list: () => this.timers.list(),
+      list: (body) => this.listTimers(body.sessionID != null ? String(body.sessionID) : undefined),
       set: (body) => this.setTimerFromSession(body),
-      cancel: (id) => this.timers.cancel(id),
+      cancel: (id, sessionID) => this.cancelTimer(id, sessionID),
+      contextWatch: {
+        list: (body) => this.listContextWatches(body.sessionID != null ? String(body.sessionID) : undefined),
+        set: (body) => this.setContextWatchFromSession(body),
+        cancel: (id, sessionID) => this.cancelContextWatch(id, sessionID),
+      },
       terminal: {
         open: (b) => {
           this.markWatched(b.sessionID != null ? String(b.sessionID) : undefined, b.directory != null ? String(b.directory) : undefined)
@@ -257,15 +332,28 @@ export class Bridge {
             b.notifyAfterSec != null ? Number(b.notifyAfterSec) : undefined,
           )
         },
-        observe: (b) =>
-          this.terminals.observe(b.id, b.offset != null ? Number(b.offset) : undefined, b.limit != null ? Number(b.limit) : undefined),
+        observe: (b) => {
+          this.markWatched(b.sessionID != null ? String(b.sessionID) : undefined, b.directory != null ? String(b.directory) : undefined)
+          return this.terminals.observe(
+            b.id,
+            b.offset != null ? Number(b.offset) : undefined,
+            b.limit != null ? Number(b.limit) : undefined,
+            b.sessionID != null ? String(b.sessionID) : undefined,
+          )
+        },
         notify: (b) => {
           this.markWatched(b.sessionID != null ? String(b.sessionID) : undefined, b.directory != null ? String(b.directory) : undefined)
-          return this.terminals.notify(b.id, b.afterSec)
+          return this.terminals.notify(b.id, b.afterSec, b.sessionID != null ? String(b.sessionID) : undefined)
         },
-        cancel: (b) => this.terminals.cancel(b.id),
-        list: () => this.terminals.list(),
-        close: (b) => this.terminals.close(b.id),
+        cancel: (b) => {
+          this.markWatched(b.sessionID != null ? String(b.sessionID) : undefined, b.directory != null ? String(b.directory) : undefined)
+          return this.terminals.cancel(b.id, b.sessionID != null ? String(b.sessionID) : undefined)
+        },
+        list: (b) => this.terminals.list(b.sessionID != null ? String(b.sessionID) : undefined),
+        close: (b) => {
+          this.markWatched(b.sessionID != null ? String(b.sessionID) : undefined, b.directory != null ? String(b.directory) : undefined)
+          return this.terminals.close(b.id, b.sessionID != null ? String(b.sessionID) : undefined)
+        },
       },
       phone: {
         open: (b) => this.phoneOpen(b),
@@ -315,6 +403,7 @@ export class Bridge {
     rt.busy = false
     rt.queue.clear()
     this.inbox.delete(old)
+    this.contextWatches.removeBySession(old)
     this.runtimes.set(id, rt)
     return old
   }
@@ -571,6 +660,10 @@ export class Bridge {
       if (status?.type === "idle") void this.becameIdle(String(props.sessionID))
     } else if (e.type === "permission.asked") {
       this.onPermissionAsked(props, directory)
+    } else if (e.type === "session.deleted") {
+      const info = props.info as { id?: string } | undefined
+      const sid = String(info?.id ?? "")
+      if (sid) this.contextWatches.removeBySession(sid)
     } else if (e.type === "permission.replied") {
       const requestID = String(props.requestID ?? props.permissionID ?? "")
       const entry = this.pendingPermissions.get(requestID)
@@ -1013,5 +1106,42 @@ export class Bridge {
       return
     }
     log("timer", `fired without a delivery channel: ${text}`)
+  }
+
+  // ---------- context watches ----------
+
+  /** Current context usage of a session: latest non-zero assistant token total (see tools/ctx.py). */
+  private async probeContext(w: ContextWatchRecord): Promise<number> {
+    const msgs = await getMessages(this.client, w.sessionID, w.directory)
+    const from = Math.max(0, msgs.length - 10)
+    for (let i = msgs.length - 1; i >= from; i--) {
+      const info = msgs[i].info as { role?: string; tokens?: { total?: number; input?: number; output?: number; reasoning?: number; cache?: { read?: number } } }
+      if (info?.role !== "assistant" || !info.tokens) continue
+      const t = info.tokens
+      const total = t.total ?? (t.input ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0) + (t.cache?.read ?? 0)
+      if (total) return total
+    }
+    return 0
+  }
+
+  private onContextFire(w: ContextWatchRecord, tokens: number): void {
+    const k = (n: number) => `${Math.round(n / 1000)}k`
+    const text = `[context] ${w.message}\n(${k(tokens)}/${k(w.threshold)})`
+    const wake = `[context ${w.id}] ${w.message} (${k(tokens)}/${k(w.threshold)})`
+    const [kind, a, b] = w.origin.split("|")
+
+    if (kind === "feishu") {
+      const rt = this.byBot.get(a)
+      if (rt && b) void rt.feishu.sendText(b, text)
+      else log("context", `fired but bot ${a} not found: ${text}`)
+      if (rt) this.wakeSession(rt.sessionId, rt.directory, `msg_context_${w.id}`, wake, undefined, b)
+      return
+    }
+    if (kind === "session") {
+      this.wakeSession(b, a, `msg_context_${w.id}`, wake)
+      log("context", `queued wake for session ${b}: ${text}`)
+      return
+    }
+    log("context", `fired without a delivery channel: ${text}`)
   }
 }

@@ -7,7 +7,7 @@ export interface TerminalHandlers {
   observe(body: Record<string, unknown>): unknown
   notify(body: Record<string, unknown>): unknown
   cancel(body: Record<string, unknown>): unknown
-  list(): unknown
+  list(body: Record<string, unknown>): unknown
   close(body: Record<string, unknown>): unknown
 }
 
@@ -19,9 +19,14 @@ export interface PhoneHandlers {
 }
 
 export interface ControlHandlers {
-  list(): unknown
+  list(body: Record<string, unknown>): unknown
   set(body: Record<string, unknown>): unknown
-  cancel(id: string): unknown
+  cancel(id: string, sessionID?: string): unknown
+  contextWatch?: {
+    list(body: Record<string, unknown>): unknown
+    set(body: Record<string, unknown>): unknown
+    cancel(id: string, sessionID?: string): unknown
+  }
   terminal?: TerminalHandlers
   phone?: PhoneHandlers
 }
@@ -67,7 +72,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, token: string, 
   const url = new URL(req.url ?? "/", "http://127.0.0.1")
   try {
     if (req.method === "GET" && url.pathname === "/timers") {
-      send(res, 200, { timers: h.list() })
+      send(res, 200, { timers: h.list({ sessionID: url.searchParams.get("sessionID") ?? undefined }) })
       return
     }
     if (req.method === "POST" && url.pathname === "/timers") {
@@ -77,8 +82,25 @@ async function handle(req: IncomingMessage, res: ServerResponse, token: string, 
     }
     if (req.method === "POST" && url.pathname === "/timers/cancel") {
       const body = await readBody(req)
-      send(res, 200, { timer: h.cancel(String(body.id ?? "")) })
+      send(res, 200, { timer: h.cancel(String(body.id ?? ""), body.sessionID != null ? String(body.sessionID) : undefined) })
       return
+    }
+    if (h.contextWatch) {
+      const cw = h.contextWatch
+      if (req.method === "GET" && url.pathname === "/context-watches") {
+        send(res, 200, { watches: cw.list({ sessionID: url.searchParams.get("sessionID") ?? undefined }) })
+        return
+      }
+      if (req.method === "POST" && url.pathname === "/context-watches") {
+        const body = await readBody(req)
+        send(res, 200, { watch: cw.set(body) })
+        return
+      }
+      if (req.method === "POST" && url.pathname === "/context-watches/cancel") {
+        const body = await readBody(req)
+        send(res, 200, { watch: cw.cancel(String(body.id ?? ""), body.sessionID != null ? String(body.sessionID) : undefined) })
+        return
+      }
     }
     if (h.phone) {
       const p = h.phone
@@ -104,7 +126,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, token: string, 
     if (h.terminal) {
       const t = h.terminal
       if (req.method === "GET" && url.pathname === "/terminal") {
-        send(res, 200, { sessions: await t.list() })
+        send(res, 200, { sessions: await t.list({ sessionID: url.searchParams.get("sessionID") ?? undefined }) })
         return
       }
       if (req.method === "POST" && url.pathname.startsWith("/terminal/")) {

@@ -52,8 +52,8 @@ export const KiloResidentTimer: Plugin = async ({ directory }) => {
       cancel_timer: tool({
         description: "Cancel a pending timer by id.",
         args: { id: tool.schema.string().describe("timer id") },
-        execute: async (args) => {
-          const j = await call("/timers/cancel", { method: "POST", body: JSON.stringify({ id: args.id }) })
+        execute: async (args, context) => {
+          const j = await call("/timers/cancel", { method: "POST", body: JSON.stringify({ id: args.id, sessionID: context.sessionID }) })
           const t = j.timer as { id: string } | null
           return t ? `Cancelled ${t.id}` : `No pending timer ${args.id}`
         },
@@ -62,8 +62,8 @@ export const KiloResidentTimer: Plugin = async ({ directory }) => {
       list_timers: tool({
         description: "List pending timers.",
         args: {},
-        execute: async () => {
-          const j = await call("/timers")
+        execute: async (_args, context) => {
+          const j = await call(`/timers?sessionID=${encodeURIComponent(context.sessionID)}`)
           const list = (j.timers ?? []).filter((t: { status: string }) => t.status === "pending")
           if (list.length === 0) return "No pending timers."
           return list

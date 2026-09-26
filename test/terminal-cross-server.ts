@@ -42,7 +42,7 @@ try {
   }
   check("wake reached cross-server session", !!wake)
   if (wake) check("wake has output", wake.parts.some((p) => p.type === "text" && p.text.includes("CROSS_SERVER_DONE")))
-  await api("/terminal/close", { method: "POST", body: JSON.stringify({ id }) })
+  await api("/terminal/close", { method: "POST", body: JSON.stringify({ id, sessionID: sid }) })
 } finally {
   await client.session.delete({ path: { id: sid }, query: { directory: DIRECTORY } }).catch(() => {})
 }
