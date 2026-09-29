@@ -7,6 +7,7 @@ import { TimerStore } from "./timer.ts"
 import { ContextWatchStore } from "./context-watch.ts"
 import { TerminalManager, type TerminalSession } from "./terminal.ts"
 import { PhoneManager, formatInbound, type PhoneInbound } from "./phone.ts"
+import { startHandoff, type HandoffResult } from "./handoff.ts"
 import { matchesAllow } from "./permission.ts"
 import { startControl, type ControlServer } from "./control.ts"
 import { log, warn } from "./log.ts"
@@ -267,6 +268,18 @@ export class Bridge {
     })
   }
 
+  private async handoffFromSession(body: Record<string, unknown>): Promise<HandoffResult> {
+    const sessionID = body.sessionID != null ? String(body.sessionID) : undefined
+    const explicit = body.directory != null ? String(body.directory).trim() : ""
+    const directory = explicit || (sessionID ? (this.runtimes.get(sessionID)?.directory ?? "") : "")
+    return startHandoff(this.client, {
+      title: String(body.title ?? ""),
+      message: String(body.message ?? body.text ?? ""),
+      directory,
+      timeoutMs: body.timeoutSec != null ? Number(body.timeoutSec) * 1000 : undefined,
+    })
+  }
+
   private writeControlFile(port: number, token: string): void {
     const dir = join(homedir(), ".local", "state", "kilo-resident")
     mkdirSync(dir, { recursive: true })
@@ -361,6 +374,7 @@ export class Bridge {
         status: () => this.phone?.status() ?? { running: false },
         close: () => this.phoneClose(),
       },
+      handoff: (b) => this.handoffFromSession(b),
     })
     this.writeControlFile(port, token)
 

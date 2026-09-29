@@ -29,6 +29,8 @@ export interface ControlHandlers {
   }
   terminal?: TerminalHandlers
   phone?: PhoneHandlers
+  /** Start a fresh Kilo session and confirm it is running (hand-off). */
+  handoff?(body: Record<string, unknown>): Promise<unknown>
 }
 
 export interface ControlServer {
@@ -141,6 +143,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, token: string, 
         send(res, 404, { error: `unknown terminal op: ${op}` })
         return
       }
+    }
+    if (h.handoff && req.method === "POST" && url.pathname === "/handoff") {
+      const body = await readBody(req)
+      send(res, 200, { handoff: await h.handoff(body) })
+      return
     }
     send(res, 404, { error: "not found" })
   } catch (err) {

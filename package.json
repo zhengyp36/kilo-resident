@@ -23,7 +23,8 @@
     "test:permission": "node test/permission.ts",
     "test:permission-retry": "node test/permission-retry.ts",
     "test:permission-notify": "node test/permission-notify.ts",
-    "test:phone": "node test/phone.ts"
+    "test:phone": "node test/phone.ts",
+    "test:handoff": "node test/handoff-integration.ts"
   },
   "dependencies": {
     "@kilocode/plugin": "^7.3.21",
