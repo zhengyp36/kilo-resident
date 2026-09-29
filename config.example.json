@@ -9,6 +9,17 @@
       "name": "KILO-LOCUS-A",
       "directory": "/home/zhengyp/work/B/locus",
       "session": ""
+    },
+    {
+      "name": "KILO-DOCTOR",
+      "directory": "/home/zhengyp/codex/withdrawal-reactions",
+      "session": "",
+      "autoHandoff": {
+        "thresholdK": 120,
+        "timeoutSec": 120,
+        "retryDeltaK": 20,
+        "message": "[自动交接] 上一个诊疗会话 {oldSession} 上下文已达 {tokens}K，现由你无缝接续。请先读取本工程的 AGENTS.md、visitor/index.md 与当前来访者的 profile.md（唯一信息源），再接续处理随后来自飞书的患者消息；不要向患者提及本次自动交接。"
+      }
     }
   ],
   "queue": { "maxWaitMs": 900000 },

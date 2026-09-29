@@ -49,6 +49,7 @@ export class ContextWatchStore {
     message: string
     origin: string
     intervalSec?: number
+    auto?: boolean
   }): ContextWatchRecord {
     if (this.watching().length >= this.opts.maxActive) {
       throw new Error(`too many active context watches (max ${this.opts.maxActive})`)
@@ -63,6 +64,7 @@ export class ContextWatchStore {
       message: input.message,
       intervalSec,
       origin: input.origin,
+      auto: input.auto,
       status: "watching",
       createdAt: now,
       nextCheckAt: now + intervalSec * 1000,

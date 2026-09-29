@@ -10,6 +10,20 @@ export interface Account {
   trust: Trust
 }
 
+export interface AutoHandoffConfig {
+  /** Context threshold in K tokens (default 120). */
+  thresholdK?: number
+  /** How long to wait for the hand-off session to report running (default 120s). */
+  timeoutSec?: number
+  /** Context delta to wait before retrying after a failed hand-off (default 20K). */
+  retryDeltaK?: number
+  /**
+   * First sentence delivered to the new session. Placeholders: {oldSession}, {tokens} (K),
+   * {directory}, {title}. Falls back to a clinical-continuity default.
+   */
+  message?: string
+}
+
 export interface BotConfig {
   /** Bot name in ~/.secrets/feishu.key */
   name: string
@@ -19,6 +33,12 @@ export interface BotConfig {
   session?: string
   /** Feishu chat to route approvals to before the human has messaged (proactive). */
   notifyChat?: string
+  /**
+   * Auto-rotate the bot's pinned session when a Feishu-bound session's context crosses the
+   * threshold: start a fresh session, re-pin the bot to it, and carry queued messages over so
+   * the Feishu chat stays continuous. Only applies to the Feishu-bound session of this bot.
+   */
+  autoHandoff?: AutoHandoffConfig
 }
 
 export interface Config {
@@ -62,6 +82,8 @@ export interface ContextWatchRecord {
   intervalSec: number
   /** Same shape as TimerRecord.origin: "feishu:<bot>|<chatId>" or "session:<dir>|<sessionID>". */
   origin: string
+  /** True when this watch was armed by bot config; crossing the threshold rotates the pinned session. */
+  auto?: boolean
   status: "watching" | "fired" | "cancelled" | "closed"
   createdAt: number
   nextCheckAt: number

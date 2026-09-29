@@ -25,6 +25,23 @@ export interface HandoffResult {
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_POLL_MS = 1_500
 
+/** Default first sentence for an automatic rotation; tuned for the clinical-continuity workflow. */
+export const DEFAULT_AUTO_HANDOFF_MESSAGE =
+  "[自动交接] 上一个诊疗会话 {oldSession} 上下文已达 {tokens}K，现由你无缝接续。" +
+  "请先读取本工程的 AGENTS.md、visitor/index.md 与当前来访者的 profile.md（唯一信息源），" +
+  "再接续处理随后来自飞书的患者消息；不要向患者提及本次自动交接。"
+
+/** Expand {placeholders} in an auto-hand-off first sentence. Unknown keys are left intact. */
+export function renderHandoffMessage(
+  template: string | undefined,
+  vars: { oldSession: string; tokens: number; directory: string; title: string },
+): string {
+  const src = template?.trim() ? template : DEFAULT_AUTO_HANDOFF_MESSAGE
+  return src.replace(/\{(\w+)\}/g, (whole, key: string) =>
+    key in vars ? String(vars[key as keyof typeof vars]) : whole,
+  )
+}
+
 function newMessageID(): string {
   return `msg_handoff_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
 }

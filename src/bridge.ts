@@ -7,7 +7,7 @@ import { TimerStore } from "./timer.ts"
 import { ContextWatchStore } from "./context-watch.ts"
 import { TerminalManager, type TerminalSession } from "./terminal.ts"
 import { PhoneManager, formatInbound, type PhoneInbound } from "./phone.ts"
-import { startHandoff, type HandoffResult } from "./handoff.ts"
+import { startHandoff, renderHandoffMessage, type HandoffResult } from "./handoff.ts"
 import { matchesAllow } from "./permission.ts"
 import { startControl, type ControlServer } from "./control.ts"
 import { log, warn } from "./log.ts"
@@ -57,6 +57,12 @@ interface Runtime {
   lastSessions?: SessionInfo[]
   /** Set while becameIdle is resolving/awaiting a reply, to avoid concurrent duplicate sends. */
   resolving?: boolean
+  /** True while an auto hand-off is in flight; blocks inbound injection and idle re-entry. */
+  handoffRunning?: boolean
+  /** Threshold crossed but the session was busy; run the auto hand-off at the next idle. */
+  pendingHandoff?: { tokens: number }
+  /** Pin switch requested by a session-initiated `handoff`; applied once the current turn settles. */
+  pendingSwitch?: string
 }
 
 /** One notification-type event awaiting a wake (terminal done, timer, phone). */
@@ -271,13 +277,27 @@ export class Bridge {
   private async handoffFromSession(body: Record<string, unknown>): Promise<HandoffResult> {
     const sessionID = body.sessionID != null ? String(body.sessionID) : undefined
     const explicit = body.directory != null ? String(body.directory).trim() : ""
-    const directory = explicit || (sessionID ? (this.runtimes.get(sessionID)?.directory ?? "") : "")
-    return startHandoff(this.client, {
+    const rt = sessionID ? this.runtimes.get(sessionID) : undefined
+    const directory = explicit || rt?.directory || ""
+    const r = await startHandoff(this.client, {
       title: String(body.title ?? ""),
       message: String(body.message ?? body.text ?? ""),
       directory,
       timeoutMs: body.timeoutSec != null ? Number(body.timeoutSec) * 1000 : undefined,
     })
+    if (r.ok && r.sessionID && rt) {
+      // Re-pin the bot to the new session. If a turn is still in flight, defer the switch so the
+      // reply for the current Feishu message still routes to the old session first.
+      if (rt.busy || rt.resolving || rt.inflight) {
+        rt.pendingSwitch = r.sessionID
+        log("handoff", `deferred pin switch ${rt.name} -> ${r.sessionID} until idle`)
+      } else {
+        this.switchSession(rt, r.sessionID, { keepQueue: true })
+        this.armAutoWatch(rt)
+        log("handoff", `pinned ${rt.name} -> ${r.sessionID}`)
+      }
+    }
+    return r
   }
 
   private writeControlFile(port: number, token: string): void {
@@ -302,6 +322,7 @@ export class Bridge {
       this.runtimes.set(sessionId, rt)
       this.byBot.set(bot.name, rt)
       this.markWatched(sessionId, bot.directory)
+      this.armAutoWatch(rt)
       feishu.start()
       log("bridge", `bot ${bot.name} dir=${bot.directory} session=${sessionId}`)
     }
@@ -310,6 +331,10 @@ export class Bridge {
     for (const dir of dirs) void this.subscribeEvents(dir)
     this.timers.start()
     this.contextWatches.start()
+    // Drop auto watches left over from a previous run whose session is no longer the pinned one.
+    for (const w of this.contextWatches.list()) {
+      if (w.status === "watching" && w.auto && !this.runtimes.has(w.sessionID)) this.contextWatches.cancel(w.id)
+    }
 
     const port = this.cfg.control?.port ?? 4180
     const token = this.ensureToken()
@@ -406,8 +431,12 @@ export class Bridge {
 
   // ---------- inbound ----------
 
-  /** Point a runtime at a session id (used by /new and /pin). Returns the previous id. */
-  private switchSession(rt: Runtime, id: string): string {
+  /**
+   * Point a runtime at a session id (used by /new, /pin and hand-off). Returns the previous id.
+   * With `keepQueue`, pending Feishu messages stay queued so a hand-off can flush them into the
+   * new session (continuous chat); otherwise the queue is dropped (/new, /pin).
+   */
+  private switchSession(rt: Runtime, id: string, opts?: { keepQueue?: boolean }): string {
     const old = rt.sessionId
     if (old !== id) this.runtimes.delete(old)
     this.state.sessions[rt.name] = id
@@ -415,11 +444,28 @@ export class Bridge {
     rt.sessionId = id
     rt.inflight = undefined
     rt.busy = false
-    rt.queue.clear()
+    if (!opts?.keepQueue) rt.queue.clear()
     this.inbox.delete(old)
     this.contextWatches.removeBySession(old)
     this.runtimes.set(id, rt)
     return old
+  }
+
+  /** Arm the per-bot context watch that rotates the pinned session when the threshold is crossed. */
+  private armAutoWatch(rt: Runtime): void {
+    const ah = this.cfg.bots.find((b) => b.name === rt.name)?.autoHandoff
+    if (!ah) return
+    if (this.contextWatches.list().some((w) => w.status === "watching" && w.auto && w.sessionID === rt.sessionId)) return
+    const thresholdK = ah.thresholdK ?? 120
+    this.contextWatches.set({
+      sessionID: rt.sessionId,
+      directory: rt.directory,
+      threshold: Math.round(thresholdK * 1000),
+      message: `上下文已达 ${thresholdK}K，自动续接会话`,
+      origin: `session|${rt.directory}|${rt.sessionId}`,
+      auto: true,
+    })
+    log("handoff", `armed auto watch for ${rt.name} session=${rt.sessionId} threshold=${thresholdK}K`)
   }
 
   private onInbound(botName: string, msg: InboundMessage): void {
@@ -691,7 +737,7 @@ export class Bridge {
 
   private async becameIdle(sessionId: string): Promise<void> {
     const rt = this.runtimes.get(sessionId)
-    if (rt && !rt.resolving && (rt.busy || rt.inflight)) {
+    if (rt && !rt.handoffRunning && !rt.resolving && (rt.busy || rt.inflight)) {
       rt.resolving = true
       try {
         if (rt.inflight) {
@@ -701,6 +747,20 @@ export class Bridge {
           rt.inflight = undefined
         }
         rt.busy = false
+        // A session-initiated hand-off requested a pin switch: apply it now that the reply is out.
+        if (rt.pendingSwitch) {
+          const target = rt.pendingSwitch
+          rt.pendingSwitch = undefined
+          this.switchSession(rt, target, { keepQueue: true })
+          this.armAutoWatch(rt)
+          log("handoff", `applied deferred pin switch ${rt.name} -> ${target}`)
+        }
+        // A context watch crossed the threshold while busy: rotate now, at the turn boundary.
+        if (rt.pendingHandoff) {
+          const p = rt.pendingHandoff
+          rt.pendingHandoff = undefined
+          await this.autoHandoff(rt, p.tokens)
+        }
         rt.queue.dropExpired()
         const next = rt.queue.shift()
         if (next) {
@@ -1140,6 +1200,10 @@ export class Bridge {
 
   private onContextFire(w: ContextWatchRecord, tokens: number): void {
     const k = (n: number) => `${Math.round(n / 1000)}k`
+    if (w.auto) {
+      this.requestAutoHandoff(w, tokens)
+      return
+    }
     const text = `[context] ${w.message}\n(${k(tokens)}/${k(w.threshold)})`
     const wake = `[context ${w.id}] ${w.message} (${k(tokens)}/${k(w.threshold)})`
     const [kind, a, b] = w.origin.split("|")
@@ -1157,5 +1221,81 @@ export class Bridge {
       return
     }
     log("context", `fired without a delivery channel: ${text}`)
+  }
+
+  /**
+   * A bot's auto watch crossed the threshold: rotate the pinned session so the Feishu chat keeps
+   * going in a fresh session. Ignored (and cancelled) if the watched session is no longer the
+   * bot's pinned one; deferred to the turn boundary if a turn is in flight.
+   */
+  private requestAutoHandoff(w: ContextWatchRecord, tokens: number): void {
+    const k = Math.round(tokens / 1000)
+    const rt = this.runtimes.get(w.sessionID)
+    if (!rt || rt.sessionId !== w.sessionID) {
+      log("handoff", `auto watch for stale session ${w.sessionID} at ${k}k; cancelled`)
+      this.contextWatches.cancel(w.id)
+      return
+    }
+    if (rt.busy || rt.resolving || rt.inflight || rt.queue.size > 0) {
+      rt.pendingHandoff = { tokens }
+      log("handoff", `auto hand-off deferred until idle for ${rt.name} at ${k}k`)
+      return
+    }
+    void this.autoHandoff(rt, tokens)
+  }
+
+  /**
+   * Start a fresh session for a runtime, re-pin the bot to it and carry the pending queue over so
+   * the Feishu chat stays continuous. Runs at a turn boundary (never mid-turn).
+   */
+  private async autoHandoff(rt: Runtime, tokens: number): Promise<void> {
+    const ah = this.cfg.bots.find((b) => b.name === rt.name)?.autoHandoff
+    if (!ah || rt.handoffRunning) return
+    rt.handoffRunning = true
+    rt.busy = true
+    const old = rt.sessionId
+    const k = Math.round(tokens / 1000)
+    const title = `${rt.name} ${new Date().toISOString().slice(5, 16).replace("T", " ")}`
+    const message = renderHandoffMessage(ah.message, { oldSession: old, tokens: k, directory: rt.directory, title })
+    log("handoff", `auto hand-off ${rt.name} ${old} at ${k}k -> new session`)
+    try {
+      const r = await startHandoff(this.client, {
+        title,
+        message,
+        directory: rt.directory,
+        timeoutMs: ah.timeoutSec != null ? ah.timeoutSec * 1000 : undefined,
+      })
+      if (!r.ok || !r.sessionID) {
+        warn("handoff", `auto hand-off failed for ${rt.name}: ${r.error ?? "unknown"}`)
+        rt.handoffRunning = false
+        rt.busy = false
+        if (rt.lastChatId) void rt.feishu.sendText(rt.lastChatId, `[系统] 自动续接未成功（${r.error ?? "unknown"}），会话继续。`)
+        this.notifyYz(`[kilo-resident] 自动交接失败 bot=${rt.name} session=${old}: ${r.error ?? "unknown"}`)
+        this.rearmAfterFailure(rt, tokens, ah.retryDeltaK ?? 20)
+        return
+      }
+      const prev = this.switchSession(rt, r.sessionID, { keepQueue: true })
+      this.armAutoWatch(rt)
+      log("handoff", `auto hand-off done ${rt.name}: ${prev} -> ${r.sessionID}`)
+    } catch (err) {
+      warn("handoff", `auto hand-off threw for ${rt.name}: ${String(err)}`)
+      rt.busy = false
+      rt.handoffRunning = false
+      this.rearmAfterFailure(rt, tokens, ah.retryDeltaK ?? 20)
+      return
+    }
+    rt.handoffRunning = false
+  }
+
+  /** After a failed rotation, wait for the context to grow a bit more before trying again. */
+  private rearmAfterFailure(rt: Runtime, tokens: number, deltaK: number): void {
+    this.contextWatches.set({
+      sessionID: rt.sessionId,
+      directory: rt.directory,
+      threshold: tokens + Math.max(1, deltaK) * 1000,
+      message: "上下文已超阈值，重试自动续接",
+      origin: `session|${rt.directory}|${rt.sessionId}`,
+      auto: true,
+    })
   }
 }
