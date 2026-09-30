@@ -454,9 +454,12 @@ export class Bridge {
    * Point a runtime at a session id (used by /new, /pin and hand-off). Returns the previous id.
    * With `keepQueue`, pending Feishu messages stay queued so a hand-off can flush them into the
    * new session (continuous chat); otherwise the queue is dropped (/new, /pin).
+   * Callers must switch only at a turn boundary (commands reject while busy); a live inflight
+   * here means a regression — log it loudly instead of dropping the reply silently.
    */
   private switchSession(rt: Runtime, id: string, opts?: { keepQueue?: boolean }): string {
     const old = rt.sessionId
+    if (rt.inflight) warn("bridge", `switch ${rt.name} mid-turn: dropping in-flight reply ${rt.inflight.injectedId} (chat=${rt.inflight.chatId})`)
     if (old !== id) this.runtimes.delete(old)
     this.state.sessions[rt.name] = id
     saveState(this.stateFile, this.state)
@@ -531,6 +534,10 @@ export class Bridge {
     try {
       switch (cmd) {
         case "new": {
+          if (rt.busy || rt.inflight) {
+            await reply("当前正忙，等这轮结束再切")
+            break
+          }
           const id = await createSession(this.client, rt.directory, "resident")
           const old = this.switchSession(rt, id)
           this.armAutoWatch(rt)
@@ -554,6 +561,10 @@ export class Bridge {
           break
         }
         case "pin": {
+          if (rt.busy || rt.inflight) {
+            await reply("当前正忙，等这轮结束再切")
+            break
+          }
           if (!arg) {
             await reply("用法: /pin <编号|session id>\n先发 /sessions 获取编号")
             break
