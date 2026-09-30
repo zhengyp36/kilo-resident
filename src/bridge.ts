@@ -91,6 +91,18 @@ const POST_DISPATCH_COOLDOWN_MS = 1500
 /** A session stays "watched" (has an observable sink) this long after its last explicit interaction. */
 const WATCH_TTL_MS = 60 * 60 * 1000
 
+/** Render an inbound message into the text injected into the session, appending any saved attachments as local paths. */
+function composeInboundText(msg: InboundMessage): string {
+  const parts: string[] = []
+  const body = msg.text.trim()
+  if (body) parts.push(body)
+  for (const a of msg.attachments ?? []) {
+    const label = a.kind === "image" ? "图片" : "文件"
+    parts.push(`[${label}附件已保存: ${a.path}${a.name ? ` (${a.name})` : ""}]`)
+  }
+  return parts.join("\n")
+}
+
 function timeAgo(ms: number): string {
   const diff = Date.now() - ms
   if (diff < 60_000) return "刚刚"
@@ -493,16 +505,18 @@ export class Bridge {
     }
     rt.lastChatId = msg.chatId
     this.markWatched(rt.sessionId, rt.directory)
-    if (!msg.text.trim()) {
+    const attachmentCount = msg.attachments?.length ?? 0
+    if (!msg.text.trim() && attachmentCount === 0) {
       log("bridge", "ignore empty or non-text message")
       return
     }
-    if (msg.text.trimStart().startsWith("/")) {
+    if (attachmentCount === 0 && msg.text.trimStart().startsWith("/")) {
       void this.handleCommand(rt, msg)
       return
     }
-    log("bridge", `inbound bot=${botName} from=${acc.name ?? "?"} chat=${msg.chatId}: ${msg.text.slice(0, 80)}`)
-    this.submit(rt, { ...msg, trust: acc.trust })
+    const suffix = attachmentCount ? ` (+${attachmentCount} attachment)` : ""
+    log("bridge", `inbound bot=${botName} from=${acc.name ?? "?"} chat=${msg.chatId}: ${msg.text.slice(0, 80)}${suffix}`)
+    this.submit(rt, { ...msg, text: composeInboundText(msg), trust: acc.trust })
   }
 
   private async handleCommand(rt: Runtime, msg: InboundMessage): Promise<void> {
