@@ -51,7 +51,7 @@ function newMessageID(): string {
 /**
  * Start a fresh Kilo session in `directory` with a title and first sentence, then
  * confirm it actually started — running (busy) now, or already finished its first
- * turn. Same contract as `locus/tools/handoff.py`, without spawning `kilo run`.
+ * turn. Does not spawn `kilo run`.
  */
 export async function startHandoff(client: KiloClient, opts: HandoffOptions): Promise<HandoffResult> {
   const title = opts.title.trim()

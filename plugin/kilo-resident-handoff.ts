@@ -29,7 +29,7 @@ async function call(path: string, init?: RequestInit): Promise<any> {
 /**
  * Hand-off tool backed by the resident bridge. Starts a fresh Kilo session with a
  * title and first sentence, then confirms it is actually running (or already
- * finished its first turn). Same contract as `locus/tools/handoff.py`.
+ * finished its first turn).
  */
 export const KiloResidentHandoff: Plugin = async ({ directory }) => {
   return {
