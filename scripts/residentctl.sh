@@ -3,7 +3,11 @@
 # Usage: scripts/residentctl.sh {start|stop|restart|status|logs}
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve the real script path (follows symlinks, e.g. when installed as ~/.local/bin/ctrl-kilo)
+# so REPO is correct regardless of how we were invoked.
+SELF="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"; fi
+REPO="${KILO_RESIDENT_REPO:-$(cd "$(dirname "$SELF")/.." && pwd)}"
 STATE="$HOME/.local/state/kilo-resident"
 LOG="$STATE/log"
 mkdir -p "$LOG"
@@ -74,6 +78,17 @@ attach() {
   exec kilo attach "${args[@]}"
 }
 
+install_ctrl() {
+  local target="${KILO_CTRL_BIN:-$HOME/.local/bin/ctrl-kilo}"
+  mkdir -p "$(dirname "$target")"
+  ln -sf "$REPO/scripts/residentctl.sh" "$target"
+  echo "installed: $target -> $REPO/scripts/residentctl.sh"
+  case ":$PATH:" in
+    *":$(dirname "$target"):"*) : ;;
+    *) echo "warning: $(dirname "$target") is not on PATH" ;;
+  esac
+}
+
 status() {
   if alive "$SERVE_PID"; then echo "serve : running (pid $(cat "$SERVE_PID"))"
   elif port_open "$HOST" "$PORT"; then echo "serve : listening on $HOST:$PORT (unmanaged)"
@@ -104,6 +119,9 @@ case "${1:-}" in
     stop_one bridge "$BRIDGE_PID"
     start_bridge
     ;;
+  install|link)
+    install_ctrl
+    ;;
   status)
     status
     ;;
@@ -115,7 +133,7 @@ case "${1:-}" in
     tail -n 50 -f "$SERVE_LOG" "$BRIDGE_LOG"
     ;;
   *)
-    echo "usage: $0 {start|stop|restart|bridge-restart|status|attach [session|new] [dir]|logs}" >&2
+    echo "usage: $0 {install|start|stop|restart|bridge-restart|status|attach [session|new] [dir]|logs}" >&2
     exit 1
     ;;
 esac
