@@ -36,11 +36,12 @@ export const KiloResidentHandoff: Plugin = async ({ directory }) => {
     tool: {
       handoff: tool({
         description:
-          "Start a fresh Kilo session with a title and first sentence and confirm it is running. Use this at the end of a long session to hand off (e.g. context nearly full, or stepping away): write the handoff note first, then hand off with it as the first sentence and stop. The new session is a normal session you can attach to afterwards.",
+          "Start a fresh Kilo session with a title and first sentence and confirm it is running. The new session inherits this session's current model unless `model` ('providerID/modelID') overrides it. Use this at the end of a long session to hand off (e.g. context nearly full, or stepping away): write the handoff note first, then hand off with it as the first sentence and stop. The new session is a normal session you can attach to afterwards.",
         args: {
           title: tool.schema.string().describe("session title, e.g. '26/09/29-工程整理-3'"),
           message: tool.schema.string().describe("first sentence / prompt for the new session"),
           directory: tool.schema.string().optional().describe("directory to run in (defaults to this project)"),
+          model: tool.schema.string().optional().describe("model for the new session as 'providerID/modelID'; defaults to the calling session's current model"),
           timeoutSec: tool.schema.number().optional().describe("seconds to wait for the session to report running (default 120)"),
         },
         execute: async (args, context) => {
@@ -50,6 +51,7 @@ export const KiloResidentHandoff: Plugin = async ({ directory }) => {
               title: args.title,
               message: args.message,
               directory: args.directory ?? directory ?? context.directory,
+              model: args.model,
               timeoutSec: args.timeoutSec,
               sessionID: context.sessionID,
             }),

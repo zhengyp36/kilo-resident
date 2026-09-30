@@ -1,11 +1,13 @@
 import { setTimeout as sleep } from "node:timers/promises"
 import type { KiloClient } from "@kilocode/sdk"
-import { createSession, getMessages, promptAsync, sessionStatus } from "./kilo.ts"
+import { createSession, getMessages, promptAsync, sessionStatus, type Model } from "./kilo.ts"
 
 export interface HandoffOptions {
   title: string
   message: string
   directory: string
+  /** Model for the new session; when omitted the server default applies. */
+  model?: Model
   /** How long to wait for the new session to report running (default 120s). */
   timeoutMs?: number
   /** Poll interval while waiting (default 1.5s). */
@@ -65,7 +67,7 @@ export async function startHandoff(client: KiloClient, opts: HandoffOptions): Pr
 
   const sessionID = await createSession(client, directory, title)
   const messageID = newMessageID()
-  await promptAsync(client, sessionID, directory, undefined, messageID, message)
+  await promptAsync(client, sessionID, directory, opts.model, messageID, message)
 
   const deadline = Date.now() + timeoutMs
   for (;;) {

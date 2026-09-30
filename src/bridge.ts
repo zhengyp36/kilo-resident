@@ -1,5 +1,5 @@
 import { matchAccount, loadDaemon, type FeishuCreds } from "./config.ts"
-import { makeKiloClient, createSession, listSessionIds, listSessions, getMessages, promptAsync, sessionStatus, summarize, type Model, type SessionInfo } from "./kilo.ts"
+import { makeKiloClient, createSession, listSessionIds, listSessions, getMessages, promptAsync, sessionStatus, sessionModel, parseModel, summarize, type Model, type SessionInfo } from "./kilo.ts"
 import { createKiloClient, type KiloClient } from "@kilocode/sdk"
 import { FeishuBot, type InboundMessage } from "./feishu.ts"
 import { SessionQueue } from "./queue.ts"
@@ -279,10 +279,17 @@ export class Bridge {
     const explicit = body.directory != null ? String(body.directory).trim() : ""
     const rt = sessionID ? this.runtimes.get(sessionID) : undefined
     const directory = explicit || rt?.directory || ""
+    // Model: an explicit body.model wins; otherwise inherit the calling session's current model.
+    // Fall back to undefined (server default) when the caller has no message carrying a model yet.
+    const raw = body.model != null ? String(body.model).trim() : ""
+    const requested = raw ? parseModel(raw) : undefined
+    if (raw && !requested) warn("handoff", `ignoring unparseable model "${raw}" (expected providerID/modelID)`)
+    const model = requested ?? (sessionID ? await sessionModel(this.client, sessionID, rt?.directory ?? directory) : undefined)
     const r = await startHandoff(this.client, {
       title: String(body.title ?? ""),
       message: String(body.message ?? body.text ?? ""),
       directory,
+      model,
       timeoutMs: body.timeoutSec != null ? Number(body.timeoutSec) * 1000 : undefined,
     })
     if (r.ok && r.sessionID && rt) {
@@ -1259,10 +1266,12 @@ export class Bridge {
     const message = renderHandoffMessage(ah.message, { oldSession: old, tokens: k, directory: rt.directory, title })
     log("handoff", `auto hand-off ${rt.name} ${old} at ${k}k -> new session`)
     try {
+      const model = await sessionModel(this.client, old, rt.directory)
       const r = await startHandoff(this.client, {
         title,
         message,
         directory: rt.directory,
+        model,
         timeoutMs: ah.timeoutSec != null ? ah.timeoutSec * 1000 : undefined,
       })
       if (!r.ok || !r.sessionID) {
