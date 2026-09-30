@@ -506,6 +506,10 @@ export class Bridge {
     rt.lastChatId = msg.chatId
     this.markWatched(rt.sessionId, rt.directory)
     const attachmentCount = msg.attachments?.length ?? 0
+    if (msg.attachmentsError) {
+      log("bridge", `attachment receive failed from=${acc.name ?? "?"}: ${msg.attachmentsError}`)
+      void rt.feishu.sendText(msg.chatId, `[系统] ${msg.attachmentsError}`)
+    }
     if (!msg.text.trim() && attachmentCount === 0) {
       log("bridge", "ignore empty or non-text message")
       return

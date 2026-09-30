@@ -19,6 +19,8 @@ export interface InboundMessage {
   userId?: string
   senderType?: string
   attachments?: InboundAttachment[]
+  /** Set when an image/file message could not be downloaded, so the bridge can tell the sender. */
+  attachmentsError?: string
 }
 
 const INBOX_DIR = join(homedir(), ".local", "state", "kilo-resident", "inbox")
@@ -67,47 +69,54 @@ export class FeishuBot {
   }
 
   private async handle(data: unknown): Promise<void> {
-    const d = data as {
-      message?: { chat_id: string; message_id: string; message_type: string; content: string }
-      sender?: { sender_type?: string; sender_id?: { open_id?: string; user_id?: string } }
-    }
-    const msg = d?.message
-    if (!msg) return
-    const ids = d?.sender?.sender_id
-    let content: Record<string, unknown> = {}
     try {
-      content = JSON.parse(msg.content ?? "{}") as Record<string, unknown>
-    } catch {
-      /* ignore */
+      const d = data as {
+        message?: { chat_id: string; message_id: string; message_type: string; content: string }
+        sender?: { sender_type?: string; sender_id?: { open_id?: string; user_id?: string } }
+      }
+      const msg = d?.message
+      if (!msg) return
+      const ids = d?.sender?.sender_id
+      let content: Record<string, unknown> = {}
+      try {
+        content = JSON.parse(msg.content ?? "{}") as Record<string, unknown>
+      } catch {
+        /* ignore */
+      }
+      const text = typeof content.text === "string" ? content.text : ""
+      const { attachments, error } = await this.fetchAttachments(msg, content)
+      this.onMessage({
+        chatId: msg.chat_id,
+        messageId: msg.message_id,
+        text,
+        openId: ids?.open_id,
+        userId: ids?.user_id,
+        senderType: d?.sender?.sender_type,
+        ...(attachments.length ? { attachments } : {}),
+        ...(error ? { attachmentsError: error } : {}),
+      })
+    } catch (err) {
+      warn("feishu", `handle failed bot=${this.name}: ${String(err)}`)
     }
-    const text = typeof content.text === "string" ? content.text : ""
-    const attachments = await this.fetchAttachments(msg, content)
-    this.onMessage({
-      chatId: msg.chat_id,
-      messageId: msg.message_id,
-      text,
-      openId: ids?.open_id,
-      userId: ids?.user_id,
-      senderType: d?.sender?.sender_type,
-      ...(attachments.length ? { attachments } : {}),
-    })
   }
 
   /** Download image/file resources carried by a message into the local inbox. */
   private async fetchAttachments(
     msg: { message_id: string; message_type: string },
     content: Record<string, unknown>,
-  ): Promise<InboundAttachment[]> {
-    const out: InboundAttachment[] = []
+  ): Promise<{ attachments: InboundAttachment[]; error?: string }> {
+    const attachments: InboundAttachment[] = []
     if (msg.message_type === "image" && typeof content.image_key === "string") {
       const path = await this.downloadResource(msg.message_id, content.image_key, "image")
-      if (path) out.push({ kind: "image", path })
+      if (!path) return { attachments, error: "图片接收失败，请重发或改用文字描述" }
+      attachments.push({ kind: "image", path })
     } else if (msg.message_type === "file" && typeof content.file_key === "string") {
       const name = typeof content.file_name === "string" ? content.file_name : undefined
       const path = await this.downloadResource(msg.message_id, content.file_key, "file", name)
-      if (path) out.push({ kind: "file", path, name })
+      if (!path) return { attachments, error: "文件接收失败，请重发" }
+      attachments.push({ kind: "file", path, name })
     }
-    return out
+    return { attachments }
   }
 
   private async downloadResource(
@@ -123,7 +132,9 @@ export class FeishuBot {
       })
       const ext = (name ? extname(name) : "") || extFromHeader(res.headers) || (type === "image" ? ".jpg" : ".bin")
       mkdirSync(INBOX_DIR, { recursive: true })
-      const filePath = join(INBOX_DIR, `${Date.now().toString(36)}_${messageId.replace(/[^\w.-]/g, "_")}${ext}`)
+      // Deterministic name: a redelivered event overwrites the same file instead of piling up copies.
+      const safe = (s: string) => s.replace(/[^\w.-]/g, "_")
+      const filePath = join(INBOX_DIR, `${safe(messageId)}_${safe(fileKey)}${ext}`)
       await res.writeFile(filePath)
       log("feishu", `saved ${type} ${fileKey} -> ${filePath}`)
       return filePath

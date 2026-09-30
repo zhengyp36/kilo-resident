@@ -7,11 +7,12 @@ const check = (name: string, cond: boolean) => {
   if (!cond) failures++
 }
 
-function makeBot(): { bot: FeishuBot; calls: { type: string; file_key: string }[] } {
+function makeBot(opts: { fail?: boolean } = {}): { bot: FeishuBot; calls: { type: string; file_key: string }[] } {
   const calls: { type: string; file_key: string }[] = []
   const bot = new FeishuBot({ name: "T", app_id: "x", app_secret: "y" }, () => {})
   ;(bot.client.im.messageResource as any).get = async (payload: { params: { type: string }; path: { file_key: string } }) => {
     calls.push({ type: payload.params.type, file_key: payload.path.file_key })
+    if (opts.fail) throw new Error("resource download denied")
     return {
       headers: { "content-type": "image/png" },
       getReadableStream: () => null,
@@ -22,20 +23,19 @@ function makeBot(): { bot: FeishuBot; calls: { type: string; file_key: string }[
 }
 
 async function deliver(bot: FeishuBot, data: unknown): Promise<InboundMessage> {
-  const got = await new Promise<InboundMessage>((resolve) => {
+  return new Promise<InboundMessage>((resolve) => {
     ;(bot as any).onMessage = (m: InboundMessage) => resolve(m)
     void (bot as any).handle(data)
   })
-  return got
 }
 
-const imageData = {
+const imageData = () => ({
   message: { chat_id: "c1", message_id: "om_1", message_type: "image", content: JSON.stringify({ image_key: "img_k1" }) },
   sender: { sender_type: "user", sender_id: { open_id: "ou_1" } },
-}
+})
 
 const { bot, calls } = makeBot()
-const msg = await deliver(bot, imageData)
+const msg = await deliver(bot, imageData())
 const att = msg.attachments?.[0]
 check("image downloaded with type=image", calls.length === 1 && calls[0].type === "image" && calls[0].file_key === "img_k1")
 check("image attachment kind", att?.kind === "image")
@@ -43,7 +43,15 @@ check("image path has .png extension", !!att?.path.endsWith(".png"))
 check("image written to disk", !!att && existsSync(att.path))
 check("image content correct", !!att && readFileSync(att.path, "utf8") === "PNG")
 check("image-only message has empty text", msg.text === "")
+check("successful message has no error", msg.attachmentsError === undefined)
+
+const redelivered = await deliver(bot, imageData())
+check("redelivery reuses the same path", redelivered.attachments?.[0]?.path === att?.path)
 if (att) rmSync(att.path, { force: true })
+
+const failed = await deliver(makeBot({ fail: true }).bot, imageData())
+check("failed download surfaces an error", typeof failed.attachmentsError === "string" && failed.attachmentsError.length > 0)
+check("failed download yields no attachments", failed.attachments === undefined)
 
 const textMsg = await deliver(makeBot().bot, {
   message: { chat_id: "c1", message_id: "om_2", message_type: "text", content: JSON.stringify({ text: "hello" }) },
