@@ -533,6 +533,7 @@ export class Bridge {
         case "new": {
           const id = await createSession(this.client, rt.directory, "resident")
           const old = this.switchSession(rt, id)
+          this.armAutoWatch(rt)
           await reply(`已开新会话 ${id}\n(旧 ${old})`)
           break
         }
@@ -581,6 +582,7 @@ export class Bridge {
             break
           }
           const old = this.switchSession(rt, target)
+          this.armAutoWatch(rt)
           await reply(`已切换会话\n${target}\n(旧 ${old})`)
           break
         }
