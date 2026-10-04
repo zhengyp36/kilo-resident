@@ -78,7 +78,7 @@
 
 - 回复路由随 per-chat 队列变准，回复精确发给对应 chat。
 - `auto-handoff` / session `handoff`：携带「当前模型」（`rt.pendingModel ?? sessionModel`）。
-- `/new`：清 pending 与所有 chat batch（吃新会话默认）；`/pin`：保留 pending，清 batch。
+- `/new`：设 pending＝白名单首个模型（下一条用户消息生效，之后靠 session 记住）并清所有 chat batch；仅针对飞书 `/new`，不影响启动/handoff 建的 session。`/pin`：保留 pending，清 batch。
 - `/compact`：仍用固定 `config.model`，本次不动。
 - `switchSession` 的队列清理、`tryDispatch` / `requestAutoHandoff` 的「队列非空」判定，都改为「任一 chat batch 非空」。
 
@@ -137,4 +137,9 @@
 遗留边界（未改，理由如下）：
 
 - `pendingModel` 只被下一条**用户入站** prompt（含排队批）消费；timer/terminal/context 的通知 wake 走 `dispatchBatch`，不带也**不消费** `pendingModel`。设计 §5 说的是「其后消息」，通知 wake 非用户消息，且消费它反而可能抢在用户消息前清掉 pending，故保留会话当前模型。
+
+## 后续变更（2026-10-04）
+
+- **`/new` 默认模型**：改 §8 的「吃新会话默认」为**设 pending＝白名单首个模型**（`src/bridge.ts` `/new` case）。白名单空则回退 `undefined`（保持原行为）；成功回执追加一行 `模型：providerID/modelID`。
+- **范围**：仅飞书 `/new`。启动/pin 失效新建（`resolveSession`）、显式 handoff、auto-handoff 均不变（后两者仍继承调用会话模型）。
 

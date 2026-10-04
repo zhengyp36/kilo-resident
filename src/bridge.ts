@@ -728,11 +728,14 @@ export class Bridge {
             await reply("当前正忙，等这轮结束再切")
             break
           }
-          rt.pendingModel = undefined
+          // Feishu /new only: default the fresh session to the first whitelisted model.
+          const model = buildModelList(this.cfg.models)[0]
+          rt.pendingModel = model
           const id = await createSession(this.client, rt.directory, "resident")
           const old = this.switchSession(rt, id)
           this.armAutoWatch(rt)
-          await reply(`已开新会话 ${id}\n(旧 ${old})`)
+          const modelNote = model ? `\n模型：${modelKey(model)}` : ""
+          await reply(`已开新会话 ${id}\n(旧 ${old})${modelNote}`)
           break
         }
         case "sessions": {

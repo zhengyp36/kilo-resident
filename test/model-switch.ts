@@ -106,5 +106,24 @@ const newBridge = (over: Record<string, unknown> = {}) => {
   check("header can be disabled", sent[0] === "hello", JSON.stringify(sent))
 }
 
+// /new (Feishu) defaults the fresh session to the first whitelisted model.
+{
+  const { bridge, rt, sent } = newBridge()
+  bridge.client = { session: { create: async () => ({ data: { id: "ses-2" } }) } }
+  await bridge.handleCommand(rt, { chatId: "c", text: "/new", openId: "o1" })
+  check("/new re-pins to the new session", rt.sessionId === "ses-2", rt.sessionId)
+  const key = rt.pendingModel ? modelKey(rt.pendingModel) : "?"
+  check("/new defaults to first whitelist model", key === "deepseek/deepseek-flash", key)
+  check("/new reply names the model", sent.at(-1)?.includes("deepseek/deepseek-flash") === true, sent.at(-1))
+}
+
+// Empty whitelist: /new keeps the old behavior (no override -> server default).
+{
+  const { bridge, rt } = newBridge({ models: [] })
+  bridge.client = { session: { create: async () => ({ data: { id: "ses-3" } }) } }
+  await bridge.handleCommand(rt, { chatId: "c", text: "/new", openId: "o1" })
+  check("/new empty whitelist keeps server default", rt.pendingModel === undefined, JSON.stringify(rt.pendingModel))
+}
+
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)
