@@ -87,7 +87,9 @@ function renderPostTag(n: PostTag): string {
     case "a":
       return n.href ? `${n.text ?? ""} (${n.href})` : (n.text ?? "")
     case "at": {
-      const who = (n.user_name ?? "").trim() || n.user_id || ""
+      // Receive events put a serial like "@_user_1" in user_id and the name in `mentions`; when the
+      // name is absent, avoid doubling the "@" from the serial.
+      const who = (n.user_name ?? "").trim() || (n.user_id ?? "").replace(/^@/, "")
       return who ? `@${who}` : "@"
     }
     case "emotion":
@@ -222,7 +224,9 @@ export class FeishuBot {
         const path = await this.downloadResource(msg.message_id, content.file_key, "file", name)
         if (path) attachments.push({ kind: "file", path, name })
         else error = "文件接收失败，请重发"
-      } else if (!text.trim()) {
+      } else if (!text.trim() && mt !== "text" && mt !== "post") {
+        // Only classify inherently non-text types as unsupported; an empty text/post message is
+        // just ignored (e.g. a recalled/edited artifact), not answered with a type warning.
         unsupported = UNSUPPORTED_TYPES[mt] ?? `该消息类型（${mt}）`
       }
 
@@ -269,26 +273,36 @@ export class FeishuBot {
   }
 
   async sendText(chatId: string, text: string): Promise<void> {
-    const r = await this.client.im.message.create({
-      params: { receive_id_type: "chat_id" },
-      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text }) },
-    })
-    if (r.code !== 0) warn("feishu", `sendText failed bot=${this.name} code=${r.code} msg=${r.msg}`)
+    try {
+      const r = await this.client.im.message.create({
+        params: { receive_id_type: "chat_id" },
+        data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text }) },
+      })
+      if (r.code !== 0) warn("feishu", `sendText failed bot=${this.name} code=${r.code} msg=${r.msg}`)
+    } catch (err) {
+      // Callers fire-and-forget (`void sendText`); never let a transport error become an
+      // unhandled rejection that takes the bridge (and its acks) down.
+      warn("feishu", `sendText threw bot=${this.name}: ${String(err)}`)
+    }
   }
 
   async sendFile(chatId: string, filePath: string): Promise<void> {
-    const up = await this.client.im.file.create({
-      data: { file_type: "stream", file_name: basename(filePath), file: createReadStream(filePath) },
-    })
-    const fileKey = up?.file_key
-    if (!fileKey) {
-      warn("feishu", `file upload failed bot=${this.name}: ${JSON.stringify(up)}`)
-      return
+    try {
+      const up = await this.client.im.file.create({
+        data: { file_type: "stream", file_name: basename(filePath), file: createReadStream(filePath) },
+      })
+      const fileKey = up?.file_key
+      if (!fileKey) {
+        warn("feishu", `file upload failed bot=${this.name}: ${JSON.stringify(up)}`)
+        return
+      }
+      const r = await this.client.im.message.create({
+        params: { receive_id_type: "chat_id" },
+        data: { receive_id: chatId, msg_type: "file", content: JSON.stringify({ file_key: fileKey }) },
+      })
+      if (r.code !== 0) warn("feishu", `sendFile failed bot=${this.name} code=${r.code} msg=${r.msg}`)
+    } catch (err) {
+      warn("feishu", `sendFile threw bot=${this.name}: ${String(err)}`)
     }
-    const r = await this.client.im.message.create({
-      params: { receive_id_type: "chat_id" },
-      data: { receive_id: chatId, msg_type: "file", content: JSON.stringify({ file_key: fileKey }) },
-    })
-    if (r.code !== 0) warn("feishu", `sendFile failed bot=${this.name} code=${r.code} msg=${r.msg}`)
   }
 }

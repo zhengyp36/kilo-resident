@@ -45,6 +45,10 @@ check("hr renders divider", mixed.text.includes("---"), mixed.text)
 check("title is prepended", mixed.text.startsWith("标题\n"), mixed.text)
 check("inline image key captured", mixed.imageKeys.includes("img_a"), JSON.stringify(mixed.imageKeys))
 
+// A mention with no name (receive events carry a serial user_id) must not double the "@".
+const bareAt = parsePostContent({ content: [[{ tag: "at", user_id: "@_user_9" }]] })
+check("bare mention not double-@", bareAt.text === "@_user_9", JSON.stringify(bareAt.text))
+
 // Sending-shape wrapper ({zh_cn}) is unwrapped.
 const wrapped = parsePostContent({ zh_cn: { title: "", content: [[{ tag: "text", text: "你好" }]] } })
 check("locale wrapper unwrapped", wrapped.text === "你好", JSON.stringify(wrapped.text))
@@ -130,6 +134,13 @@ const textMsg = await deliver(makeBot().bot, {
 })
 check("text not flagged unsupported", textMsg.unsupported === undefined)
 check("text message type preserved", textMsg.messageType === "text")
+
+// An empty text message is ignored downstream, not answered with a confusing type warning.
+const emptyText = await deliver(makeBot().bot, {
+  message: { chat_id: "c1", message_id: "om_e", message_type: "text", content: JSON.stringify({ text: "   " }) },
+  sender: { sender_type: "user", sender_id: {} },
+})
+check("empty text not flagged unsupported", emptyText.unsupported === undefined, String(emptyText.unsupported))
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)
