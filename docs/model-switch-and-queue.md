@@ -107,7 +107,7 @@
 - [x] bridge.ts：交互修正（switchSession / tryDispatch / requestAutoHandoff / handoff 携带模型）
 - [x] config.json / config.example.json 增补 models + coalesceMs
 - [x] 测试新增/改造；typecheck 全绿
-- [ ] 完工核对本文件，写「偏差记录」← 由交接后的检视会话确认
+- [x] 完工核对本文件，写「偏差记录」（检视会话确认，见文末「检视结论」）
 
 ## 偏差记录
 
@@ -120,4 +120,21 @@
 5. **config.json 为 gitignore**：`models` 落在提交的 `config.example.json`，并同步到本地 `config.json`（不提交）。
 
 待检视会话核对：以上偏差是否成立、是否有遗漏的风险（尤其 per-chat 队列与 `becameIdle`/auto-handoff 的交互）。
+
+## 检视结论（2026-10-04）
+
+对照本文逐条核对 7f07fe6，发现并修复 1 处真 bug + 3 处与设计不符，确认 5 条偏差成立。
+
+修复：
+
+1. **turn-boundary drain 被永久短路（真 bug）**：`becameIdle` 先置 `rt.resolving = true`，再用 `canStartTurn`（其含 `!resolving`）作为 drain 门；该门恒为 false，导致「在忙时静默、已 ready」的批在其后 idle 永不被 drain（多 chat 场景消息卡死）。修法：抽出 `turnFree`（只含 `!busy/!inflight/!handoffRunning`），`becameIdle` 与 `drainChat` 的门改用它；`onQuiet` 仍用 `canStartTurn`（要挡 resolving）。回归测试见 `test/inbound-ack.ts` 的 "batch drains at the turn boundary"。
+2. **`/new` 未清 `pendingModel`（违反 §8）**：切新会话前补 `rt.pendingModel = undefined`（吃新会话默认）；`/pin` 仍保留。
+3. **processing 信号措辞**：单条 drain 由「收到，处理中…」改为「收到，开始处理…」，对齐 §7。
+4. **白名单非法项静默跳过**：`buildModelList` 补 `warn`（§2 要求「跳过并 warn」）。
+
+确认成立的偏差：1（单 text 合并）、2（失败重试一次）、3（切换不校验 connected）、4（`providerCatalog.available`）、5（config.json 不入库；已同步本地）。
+
+遗留边界（未改，理由如下）：
+
+- `pendingModel` 只被下一条**用户入站** prompt（含排队批）消费；timer/terminal/context 的通知 wake 走 `dispatchBatch`，不带也**不消费** `pendingModel`。设计 §5 说的是「其后消息」，通知 wake 非用户消息，且消费它反而可能抢在用户消息前清掉 pending，故保留会话当前模型。
 

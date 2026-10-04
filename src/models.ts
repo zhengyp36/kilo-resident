@@ -1,4 +1,5 @@
 import { parseModel, type Model, type ProviderCatalog } from "./kilo.ts"
+import { warn } from "./log.ts"
 
 /** Stable "providerID/modelID" key. */
 export function modelKey(m: Model): string {
@@ -14,7 +15,10 @@ export function buildModelList(whitelist: string[] | undefined, current?: Model)
   const seen = new Set<string>()
   for (const spec of whitelist ?? []) {
     const m = parseModel(spec)
-    if (!m) continue
+    if (!m) {
+      warn("models", `skipping invalid model spec "${spec}" (expected providerID/modelID)`)
+      continue
+    }
     const key = modelKey(m)
     if (seen.has(key)) continue
     seen.add(key)

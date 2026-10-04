@@ -102,6 +102,33 @@ const reset = () => {
   check("second chat delivered after", delivered.length === 2 && delivered[1].includes("B"), JSON.stringify(delivered))
 }
 
+// A batch queued behind a running turn must drain at the next idle (turn-boundary gate).
+{
+  reset()
+  rt.chats.clear()
+  rt.busy = true
+  rt.inflight = { injectedId: "msgA", chatId: "cA", since: Date.now() }
+  bridge.client = {
+    session: {
+      messages: async () => ({
+        data: [
+          {
+            info: { role: "assistant", parentID: "msgA", providerID: "deepseek", modelID: "deepseek-flash", time: { created: 1, completed: 2 } },
+            parts: [{ type: "text", text: "replyA", time: {} }],
+          },
+        ],
+      }),
+    },
+  }
+  bridge.onInbound("TEST", inbound({ chatId: "cQ", text: "queued-behind-turn" }))
+  await sleep(60)
+  check("batch waits while the turn runs", delivered.every((t) => !t.includes("queued-behind-turn")), JSON.stringify(delivered))
+  await bridge.becameIdle("ses-1")
+  check("batch drains at the turn boundary", delivered.some((t) => t.includes("queued-behind-turn")), JSON.stringify(delivered))
+  reset()
+  rt.chats.clear()
+}
+
 // off: no receipt signals, but still delivered.
 {
   reset()

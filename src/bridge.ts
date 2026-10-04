@@ -600,7 +600,7 @@ export class Bridge {
 
   /** Merge the chat's batch into a single prompt and inject it (one turn, one reply). */
   private async drainChat(rt: Runtime, chat: ChatState): Promise<void> {
-    if (!this.canStartTurn(rt) || chat.queue.size === 0) return
+    if (!this.turnFree(rt) || chat.queue.size === 0) return
     const items: Inbound[] = []
     for (let it = chat.queue.shift(); it !== undefined; it = chat.queue.shift()) items.push(it)
     this.clearChatTimers(chat)
@@ -612,7 +612,7 @@ export class Bridge {
     rt.inflight = { injectedId, chatId, since: Date.now() }
     rt.busy = true
     if (this.ackMode(rt) === "always") {
-      const label = items.length > 1 ? `收到 ${items.length} 条，开始处理…` : "收到，处理中…"
+      const label = items.length > 1 ? `收到 ${items.length} 条，开始处理…` : "收到，开始处理…"
       void rt.feishu.sendText(chatId, label)
     }
     const model = rt.pendingModel
@@ -688,8 +688,16 @@ export class Bridge {
     return best
   }
 
+  /**
+   * True when no turn/handoff occupies the runtime. Deliberately excludes `resolving`: the idle
+   * handler holds `resolving` while it drains the next batch, so it must use this gate directly.
+   */
+  private turnFree(rt: Runtime): boolean {
+    return !rt.busy && !rt.inflight && !rt.handoffRunning
+  }
+
   private canStartTurn(rt: Runtime): boolean {
-    return !rt.busy && !rt.inflight && !rt.handoffRunning && !rt.resolving
+    return this.turnFree(rt) && !rt.resolving
   }
 
   private ackMode(rt: Runtime): "always" | "delayed" | "off" {
@@ -720,6 +728,7 @@ export class Bridge {
             await reply("当前正忙，等这轮结束再切")
             break
           }
+          rt.pendingModel = undefined
           const id = await createSession(this.client, rt.directory, "resident")
           const old = this.switchSession(rt, id)
           this.armAutoWatch(rt)
@@ -984,8 +993,9 @@ export class Bridge {
           await this.autoHandoff(rt, p.tokens)
         }
         for (const chat of rt.chats.values()) chat.queue.dropExpired()
-        // Drain the next ready batch (quiet already reached) at this turn boundary.
-        if (this.canStartTurn(rt)) {
+        // Drain the next ready batch (quiet already reached) at this turn boundary. Use turnFree,
+        // not canStartTurn: we are the resolving owner and must be allowed to start the next turn.
+        if (this.turnFree(rt)) {
           const next = this.nextReadyChat(rt)
           if (next) {
             await this.drainChat(rt, next)
