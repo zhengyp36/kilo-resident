@@ -17,6 +17,8 @@
     "attach": "bash scripts/residentctl.sh attach",
     "typecheck": "tsc --noEmit",
     "test:inbound-attachment": "node test/inbound-attachment.ts",
+    "test:inbound-post": "node test/inbound-post.ts",
+    "test:inbound-ack": "node test/inbound-ack.ts",
     "test:roundtrip": "node test/roundtrip.ts",
     "test:terminal": "node test/terminal.ts",
     "test:terminal-isolation": "node test/terminal-isolation.ts",

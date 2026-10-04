@@ -39,6 +39,14 @@ export interface BotConfig {
    * the Feishu chat stays continuous. Only applies to the Feishu-bound session of this bot.
    */
   autoHandoff?: AutoHandoffConfig
+  /**
+   * Receipt acknowledgement for accepted inbound messages: "always" replies immediately,
+   * "delayed" only speaks up if no reply lands within ackDelayMs, "off" stays quiet. Default
+   * "always". (Unsupported types and delivery errors are always reported regardless.)
+   */
+  ack?: "always" | "delayed" | "off"
+  /** Delay before a "delayed" ack fires (default 5000ms). */
+  ackDelayMs?: number
 }
 
 export interface Config {

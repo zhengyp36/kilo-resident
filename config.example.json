@@ -8,7 +8,8 @@
     {
       "name": "KILO-LOCUS-A",
       "directory": "/home/zhengyp/work/B/locus",
-      "session": ""
+      "session": "",
+      "ack": "always"
     },
     {
       "name": "KILO-DOCTOR",

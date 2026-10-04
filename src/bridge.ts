@@ -63,6 +63,8 @@ interface Runtime {
   pendingHandoff?: { tokens: number }
   /** Pin switch requested by a session-initiated `handoff`; applied once the current turn settles. */
   pendingSwitch?: string
+  /** Pending "delayed" receipt ack; cleared once a real reply goes out. */
+  ackTimer?: NodeJS.Timeout
 }
 
 /** One notification-type event awaiting a wake (terminal done, timer, phone). */
@@ -466,6 +468,7 @@ export class Bridge {
     rt.sessionId = id
     rt.inflight = undefined
     rt.busy = false
+    this.clearAck(rt)
     if (!opts?.keepQueue) rt.queue.clear()
     this.inbox.delete(old)
     this.contextWatches.removeBySession(old)
@@ -508,13 +511,21 @@ export class Bridge {
     }
     rt.lastChatId = msg.chatId
     this.markWatched(rt.sessionId, rt.directory)
+    const mt = msg.messageType ?? "unknown"
     const attachmentCount = msg.attachments?.length ?? 0
     if (msg.attachmentsError) {
       log("bridge", `attachment receive failed from=${acc.name ?? "?"}: ${msg.attachmentsError}`)
       void rt.feishu.sendText(msg.chatId, `[系统] ${msg.attachmentsError}`)
     }
+    // A type we cannot turn into session input (voice/video/sticker/...): tell the sender instead
+    // of dropping it silently.
+    if (msg.unsupported) {
+      log("bridge", `unsupported inbound type=${mt} from=${acc.name ?? "?"}: ${msg.unsupported}`)
+      void rt.feishu.sendText(msg.chatId, `收到，暂不支持${msg.unsupported}，请发文字或图片。`)
+      return
+    }
     if (!msg.text.trim() && attachmentCount === 0) {
-      log("bridge", "ignore empty or non-text message")
+      log("bridge", `ignore empty or non-text message (type=${mt})`)
       return
     }
     if (attachmentCount === 0 && msg.text.trimStart().startsWith("/")) {
@@ -522,13 +533,42 @@ export class Bridge {
       return
     }
     const suffix = attachmentCount ? ` (+${attachmentCount} attachment)` : ""
-    log("bridge", `inbound bot=${botName} from=${acc.name ?? "?"} chat=${msg.chatId}: ${msg.text.slice(0, 80)}${suffix}`)
-    this.submit(rt, { ...msg, text: composeInboundText(msg), trust: acc.trust })
+    log("bridge", `inbound bot=${botName} type=${mt} from=${acc.name ?? "?"} chat=${msg.chatId}: ${msg.text.slice(0, 80)}${suffix}`)
+    const queued = this.submit(rt, { ...msg, text: composeInboundText(msg), trust: acc.trust })
+    this.ackInbound(rt, msg, queued)
+  }
+
+  /** Send (or schedule) a receipt ack for an accepted inbound message, per the bot's ack mode. */
+  private ackInbound(rt: Runtime, msg: InboundMessage, queued: boolean): void {
+    const bot = this.cfg.bots.find((b) => b.name === rt.name)
+    const mode = bot?.ack ?? "always"
+    if (mode === "off") return
+    const text = queued ? `收到，前面还有 ${rt.queue.size} 条在处理，会依次处理。` : "收到，处理中…"
+    if (mode === "always") {
+      void rt.feishu.sendText(msg.chatId, text)
+      return
+    }
+    // delayed: only speak up if this runtime produces no reply within the window.
+    if (rt.ackTimer) return
+    const delay = bot?.ackDelayMs ?? 5000
+    rt.ackTimer = setTimeout(() => {
+      rt.ackTimer = undefined
+      void rt.feishu.sendText(msg.chatId, "收到，正在处理…")
+    }, delay)
+    rt.ackTimer.unref?.()
+  }
+
+  private clearAck(rt: Runtime): void {
+    if (rt.ackTimer) {
+      clearTimeout(rt.ackTimer)
+      rt.ackTimer = undefined
+    }
   }
 
   private async handleCommand(rt: Runtime, msg: InboundMessage): Promise<void> {
     const [cmd, ...rest] = msg.text.trim().slice(1).split(/\s+/)
     const arg = rest.join(" ").trim()
+    this.clearAck(rt)
     const reply = (t: string) => rt.feishu.sendText(msg.chatId, t)
     log("bridge", `command /${cmd} ${arg}`)
     try {
@@ -705,14 +745,16 @@ export class Bridge {
     }
   }
 
-  private submit(rt: Runtime, item: Inbound): void {
+  /** Inject now or queue behind the current turn. Returns true when the message was queued. */
+  private submit(rt: Runtime, item: Inbound): boolean {
     if (!rt.busy && !rt.inflight && rt.queue.size === 0) {
       void this.inject(rt, item)
-      return
+      return false
     }
     rt.queue.dropExpired()
     rt.queue.push(item)
     log("bridge", `queued for ${rt.name} (size=${rt.queue.size})`)
+    return true
   }
 
   private async inject(rt: Runtime, item: Inbound): Promise<void> {
@@ -727,6 +769,9 @@ export class Bridge {
       warn("bridge", `inject failed: ${String(err)}`)
       rt.busy = false
       rt.inflight = undefined
+      this.clearAck(rt)
+      // Never leave the sender guessing when delivery itself fails.
+      void rt.feishu.sendText(item.chatId, "[系统] 消息处理失败，请重试。")
     }
   }
 
@@ -835,8 +880,11 @@ export class Bridge {
             }
           }
           const body = texts.join("\n\n").trim()
+          this.clearAck(rt)
           if (body) await rt.feishu.sendText(inflight.chatId, body)
           for (const url of files) await this.sendFilePart(rt, inflight.chatId, url)
+          // Never leave the sender with silence: a completed turn with no text/files still reports.
+          if (!body && files.length === 0) await rt.feishu.sendText(inflight.chatId, "[已处理完成，无文字回复]")
           log("bridge", `reply -> chat=${inflight.chatId} chars=${body.length} files=${files.length}`)
           return true
         }
