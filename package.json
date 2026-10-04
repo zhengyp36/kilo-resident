@@ -29,7 +29,8 @@
     "test:phone": "node test/phone.ts",
     "test:handoff": "node test/handoff-integration.ts",
     "test:auto-handoff": "node test/auto-handoff.ts",
-    "test:switch-busy-guard": "node test/switch-busy-guard.ts"
+    "test:switch-busy-guard": "node test/switch-busy-guard.ts",
+    "test:model-switch": "node test/model-switch.ts"
   },
   "dependencies": {
     "@kilocode/plugin": "^7.3.21",

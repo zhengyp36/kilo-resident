@@ -6,7 +6,6 @@ import { createKiloClient } from "@kilocode/sdk"
 import { mkdirSync, writeFileSync } from "node:fs"
 import { setTimeout as sleep } from "node:timers/promises"
 import { Bridge } from "../src/bridge.ts"
-import { SessionQueue } from "../src/queue.ts"
 
 const DAEMON = process.env.KILO_DAEMON ?? "http://127.0.0.1:4097"
 const DIR = "/tmp/kilo/perm-retry"
@@ -55,7 +54,7 @@ const rt: any = {
   sessionId: sid,
   feishu: { sendText: async (chatId: string, text: string) => void sent.push({ chatId, text }) },
   busy: false,
-  queue: new SessionQueue(600_000, () => {}),
+  chats: new Map(),
   wakes: [],
   lastChatId: "chat-test",
 }

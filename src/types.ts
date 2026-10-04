@@ -47,14 +47,18 @@ export interface BotConfig {
   ack?: "always" | "delayed" | "off"
   /** Delay before a "delayed" ack fires (default 5000ms). */
   ackDelayMs?: number
+  /** Prefix each model reply with the answering model id (default true). */
+  modelHeader?: boolean
 }
 
 export interface Config {
   model: { providerID: string; modelID: string }
+  /** Whitelist of switchable models, each "providerID/modelID". Order fixes /models numbering. */
+  models?: string[]
   daemon?: { url?: string; username?: string; password?: string }
   accounts: Account[]
   bots: BotConfig[]
-  queue?: { maxWaitMs?: number }
+  queue?: { maxWaitMs?: number; coalesceMs?: number }
   timers?: { maxActive?: number; minIntervalSec?: number }
   contextWatch?: { maxActive?: number; intervalSec?: number; minIntervalSec?: number }
   terminal?: { maxOutput?: number; defaultObserveLimit?: number }

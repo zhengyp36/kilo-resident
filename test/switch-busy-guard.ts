@@ -2,7 +2,6 @@
 // flight, so the in-flight reply is never silently dropped. Also covers switchSession mechanics.
 import { mkdirSync } from "node:fs"
 import { Bridge } from "../src/bridge.ts"
-import { SessionQueue } from "../src/queue.ts"
 
 const DIR = "/tmp/kilo/switch-busy-guard"
 mkdirSync(DIR, { recursive: true })
@@ -33,7 +32,7 @@ const mkRt = (busy: boolean): any => ({
   feishu: { sendText: async (_chatId: string, text: string) => void sent.push(text) },
   busy,
   inflight: busy ? { injectedId: "msg_1", chatId: "chat-1", since: Date.now() } : undefined,
-  queue: new SessionQueue(600_000, () => {}),
+  chats: new Map(),
 })
 const msg = (text: string): any => ({ messageId: `m-${text}`, chatId: "chat-1", text, openId: "o1" })
 

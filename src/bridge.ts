@@ -1,5 +1,6 @@
 import { matchAccount, loadDaemon, type FeishuCreds } from "./config.ts"
-import { makeKiloClient, createSession, listSessionIds, listSessions, getMessages, promptAsync, sessionStatus, sessionModel, parseModel, summarize, type Model, type SessionInfo } from "./kilo.ts"
+import { makeKiloClient, createSession, listSessionIds, listSessions, getMessages, promptAsync, sessionStatus, sessionModel, parseModel, providerCatalog, summarize, type Model, type SessionInfo } from "./kilo.ts"
+import { buildModelList, modelKey, formatModelHeader, renderModelList } from "./models.ts"
 import { createKiloClient, type KiloClient } from "@kilocode/sdk"
 import { FeishuBot, type InboundMessage } from "./feishu.ts"
 import { SessionQueue } from "./queue.ts"
@@ -44,15 +45,36 @@ interface PendingPermission {
   retryCount: number
 }
 
+/**
+ * Per-chat inbound state. Messages for one chat coalesce into one batch (drained as a single
+ * prompt) instead of one turn per message; queues are per chat so replies route to the right chat.
+ */
+interface ChatState {
+  chatId: string
+  queue: SessionQueue<Inbound>
+  /** Coalesce (linger) timer: reset on each inbound, fires once the sender pauses. */
+  quietTimer?: NodeJS.Timeout
+  /** Pending "delayed" queued notice timer. */
+  queuedNoticeTimer?: NodeJS.Timeout
+  /** Timestamp of the newest inbound, used for FIFO fairness across chats. */
+  lastInboundAt: number
+  /** True once the quiet timer fired with a non-empty batch (batch is ready to drain). */
+  ready: boolean
+  /** True once this batch has been told it is queued behind a running turn. */
+  queuedNotified: boolean
+}
+
 interface Runtime {
   name: string
   directory: string
   sessionId: string
   feishu: FeishuBot
   busy: boolean
-  queue: SessionQueue<Inbound>
+  chats: Map<string, ChatState>
   inflight?: Inflight
   lastChatId?: string
+  /** One-shot model override applied to the next prompt (set by /models <N>). */
+  pendingModel?: Model
   /** Snapshot from the last /sessions listing, so /pin <n> resolves to a stable id. */
   lastSessions?: SessionInfo[]
   /** Set while becameIdle is resolving/awaiting a reply, to avoid concurrent duplicate sends. */
@@ -63,8 +85,6 @@ interface Runtime {
   pendingHandoff?: { tokens: number }
   /** Pin switch requested by a session-initiated `handoff`; applied once the current turn settles. */
   pendingSwitch?: string
-  /** Pending "delayed" receipt ack; cleared once a real reply goes out. */
-  ackTimer?: NodeJS.Timeout
 }
 
 /** One notification-type event awaiting a wake (terminal done, timer, phone). */
@@ -90,6 +110,8 @@ const NOTIFY_DEBOUNCE_MS = 1000
 const DISPATCH_INTERVAL_MS = 1000
 /** Ignore session.idle right after a dispatch, while the server transitions to busy. */
 const POST_DISPATCH_COOLDOWN_MS = 1500
+/** Default coalesce (linger) window: buffer same-chat messages until the sender pauses this long. */
+const DEFAULT_COALESCE_MS = 700
 /** A session stays "watched" (has an observable sink) this long after its last explicit interaction. */
 const WATCH_TTL_MS = 60 * 60 * 1000
 
@@ -298,7 +320,7 @@ export class Bridge {
     const raw = body.model != null ? String(body.model).trim() : ""
     const requested = raw ? parseModel(raw) : undefined
     if (raw && !requested) warn("handoff", `ignoring unparseable model "${raw}" (expected providerID/modelID)`)
-    const model = requested ?? (sessionID ? await sessionModel(this.client, sessionID, rt?.directory ?? directory) : undefined)
+    const model = requested ?? rt?.pendingModel ?? (sessionID ? await sessionModel(this.client, sessionID, rt?.directory ?? directory) : undefined)
     const r = await startHandoff(this.client, {
       title: String(body.title ?? ""),
       message: String(body.message ?? body.text ?? ""),
@@ -336,10 +358,7 @@ export class Bridge {
       }
       const sessionId = await this.resolveSession(bot.name, bot.directory, bot.session)
       const feishu = new FeishuBot(creds, (m) => this.onInbound(bot.name, m))
-      const queue = new SessionQueue<Inbound>(this.cfg.queue?.maxWaitMs ?? 900_000, (item) => {
-        void this.byBot.get(bot.name)?.feishu.sendText(item.chatId, "[busy] dropped an earlier message after waiting too long; please resend.")
-      })
-      const rt: Runtime = { name: bot.name, directory: bot.directory, sessionId, feishu, busy: false, queue }
+      const rt: Runtime = { name: bot.name, directory: bot.directory, sessionId, feishu, busy: false, chats: new Map() }
       this.runtimes.set(sessionId, rt)
       this.byBot.set(bot.name, rt)
       this.markWatched(sessionId, bot.directory)
@@ -468,8 +487,7 @@ export class Bridge {
     rt.sessionId = id
     rt.inflight = undefined
     rt.busy = false
-    this.clearAck(rt)
-    if (!opts?.keepQueue) rt.queue.clear()
+    if (!opts?.keepQueue) this.clearChats(rt)
     this.inbox.delete(old)
     this.contextWatches.removeBySession(old)
     this.runtimes.set(id, rt)
@@ -534,41 +552,165 @@ export class Bridge {
     }
     const suffix = attachmentCount ? ` (+${attachmentCount} attachment)` : ""
     log("bridge", `inbound bot=${botName} type=${mt} from=${acc.name ?? "?"} chat=${msg.chatId}: ${msg.text.slice(0, 80)}${suffix}`)
-    const queued = this.submit(rt, { ...msg, text: composeInboundText(msg), trust: acc.trust })
-    this.ackInbound(rt, msg, queued)
+    this.enqueueInbound(rt, { ...msg, text: composeInboundText(msg), trust: acc.trust })
   }
 
-  /** Send (or schedule) a receipt ack for an accepted inbound message, per the bot's ack mode. */
-  private ackInbound(rt: Runtime, msg: InboundMessage, queued: boolean): void {
-    const bot = this.cfg.bots.find((b) => b.name === rt.name)
-    const mode = bot?.ack ?? "always"
-    if (mode === "off") return
-    const text = queued ? `收到，前面还有 ${rt.queue.size} 条在处理，会依次处理。` : "收到，处理中…"
-    if (mode === "always") {
-      void rt.feishu.sendText(msg.chatId, text)
-      return
-    }
-    // delayed: only speak up if this runtime produces no reply within the window.
-    if (rt.ackTimer) return
-    const delay = bot?.ackDelayMs ?? 5000
-    rt.ackTimer = setTimeout(() => {
-      rt.ackTimer = undefined
-      void rt.feishu.sendText(msg.chatId, "收到，正在处理…")
-    }, delay)
-    rt.ackTimer.unref?.()
+  // ---------- coalescing queue (per chat) ----------
+
+  /** Add an inbound message to its chat's batch and (re)arm the linger timer. */
+  private enqueueInbound(rt: Runtime, item: Inbound): void {
+    const chat = this.chatState(rt, item.chatId)
+    chat.queue.dropExpired()
+    chat.queue.push(item)
+    chat.lastInboundAt = Date.now()
+    chat.ready = false
+    this.clearChatTimers(chat)
+    chat.quietTimer = setTimeout(() => this.onQuiet(rt, chat), this.coalesceMs())
+    chat.quietTimer.unref?.()
+    log("bridge", `coalesce ${rt.name} chat=${item.chatId} batch=${chat.queue.size} (linger ${this.coalesceMs()}ms)`)
   }
 
-  private clearAck(rt: Runtime): void {
-    if (rt.ackTimer) {
-      clearTimeout(rt.ackTimer)
-      rt.ackTimer = undefined
+  /** The sender paused: drain now if the session is free, otherwise tell them it is queued. */
+  private onQuiet(rt: Runtime, chat: ChatState): void {
+    chat.quietTimer = undefined
+    if (chat.queue.size === 0) return
+    chat.ready = true
+    if (this.canStartTurn(rt)) void this.drainChat(rt, chat)
+    else this.notifyQueued(rt, chat)
+  }
+
+  /** One "queued behind a running turn" notice per batch (per ack mode). */
+  private notifyQueued(rt: Runtime, chat: ChatState): void {
+    const mode = this.ackMode(rt)
+    if (mode === "off" || chat.queuedNotified) return
+    const send = () => {
+      chat.queuedNoticeTimer = undefined
+      if (chat.queuedNotified) return
+      chat.queuedNotified = true
+      void rt.feishu.sendText(chat.chatId, "前面还在处理，已排队。")
     }
+    if (mode === "delayed") {
+      if (chat.queuedNoticeTimer) return
+      chat.queuedNoticeTimer = setTimeout(send, this.ackDelayMs(rt))
+      chat.queuedNoticeTimer.unref?.()
+    } else {
+      send()
+    }
+  }
+
+  /** Merge the chat's batch into a single prompt and inject it (one turn, one reply). */
+  private async drainChat(rt: Runtime, chat: ChatState): Promise<void> {
+    if (!this.canStartTurn(rt) || chat.queue.size === 0) return
+    const items: Inbound[] = []
+    for (let it = chat.queue.shift(); it !== undefined; it = chat.queue.shift()) items.push(it)
+    this.clearChatTimers(chat)
+    chat.ready = false
+    chat.queuedNotified = false
+    const chatId = chat.chatId
+    const merged = items.map((i) => i.text).join("\n\n")
+    const injectedId = `msg_feishu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
+    rt.inflight = { injectedId, chatId, since: Date.now() }
+    rt.busy = true
+    if (this.ackMode(rt) === "always") {
+      const label = items.length > 1 ? `收到 ${items.length} 条，开始处理…` : "收到，处理中…"
+      void rt.feishu.sendText(chatId, label)
+    }
+    const model = rt.pendingModel
+    try {
+      let actualId: string
+      try {
+        actualId = await this.deliver(rt.sessionId, rt.directory, injectedId, merged, undefined, model)
+      } catch (err) {
+        if (!model) throw err
+        // A stale/unauthorized model must not swallow the message: fall back to the session's own.
+        warn("bridge", `model ${modelKey(model)} prompt failed (${String(err)}); retrying without override`)
+        void rt.feishu.sendText(chatId, `[系统] 模型 ${modelKey(model)} 不可用，已改用会话模型重试。`)
+        actualId = await this.deliver(rt.sessionId, rt.directory, injectedId, merged, undefined, undefined)
+      }
+      if (rt.pendingModel === model) rt.pendingModel = undefined
+      if (rt.inflight) rt.inflight.injectedId = actualId
+      log("bridge", `injected ${actualId} -> ${rt.sessionId} (chat=${chatId}, batch=${items.length}${model ? `, model=${modelKey(model)}` : ""})`)
+    } catch (err) {
+      warn("bridge", `inject failed: ${String(err)}`)
+      rt.busy = false
+      rt.inflight = undefined
+      if (rt.pendingModel === model) rt.pendingModel = undefined
+      void rt.feishu.sendText(chatId, "[系统] 消息处理失败，请重试。")
+    }
+  }
+
+  private chatState(rt: Runtime, chatId: string): ChatState {
+    let chat = rt.chats.get(chatId)
+    if (!chat) {
+      chat = {
+        chatId,
+        queue: new SessionQueue<Inbound>(this.cfg.queue?.maxWaitMs ?? 900_000, (item) => {
+          void rt.feishu.sendText(item.chatId, "[busy] dropped an earlier message after waiting too long; please resend.")
+        }),
+        lastInboundAt: Date.now(),
+        ready: false,
+        queuedNotified: false,
+      }
+      rt.chats.set(chatId, chat)
+    }
+    return chat
+  }
+
+  private clearChatTimers(chat: ChatState): void {
+    if (chat.quietTimer) {
+      clearTimeout(chat.quietTimer)
+      chat.quietTimer = undefined
+    }
+    if (chat.queuedNoticeTimer) {
+      clearTimeout(chat.queuedNoticeTimer)
+      chat.queuedNoticeTimer = undefined
+    }
+  }
+
+  private clearChats(rt: Runtime): void {
+    for (const chat of rt.chats.values()) this.clearChatTimers(chat)
+    rt.chats.clear()
+  }
+
+  /** True while any chat has buffered inbound awaiting a turn. */
+  private hasPending(rt: Runtime): boolean {
+    for (const chat of rt.chats.values()) if (chat.queue.size > 0) return true
+    return false
+  }
+
+  /** Earliest-ready chat batch (FIFO by newest inbound), or undefined when none is ready. */
+  private nextReadyChat(rt: Runtime): ChatState | undefined {
+    let best: ChatState | undefined
+    for (const chat of rt.chats.values()) {
+      if (chat.queue.size === 0 || !chat.ready) continue
+      if (!best || chat.lastInboundAt < best.lastInboundAt) best = chat
+    }
+    return best
+  }
+
+  private canStartTurn(rt: Runtime): boolean {
+    return !rt.busy && !rt.inflight && !rt.handoffRunning && !rt.resolving
+  }
+
+  private ackMode(rt: Runtime): "always" | "delayed" | "off" {
+    return this.cfg.bots.find((b) => b.name === rt.name)?.ack ?? "always"
+  }
+
+  private ackDelayMs(rt: Runtime): number {
+    return this.cfg.bots.find((b) => b.name === rt.name)?.ackDelayMs ?? 5000
+  }
+
+  private coalesceMs(): number {
+    return this.cfg.queue?.coalesceMs ?? DEFAULT_COALESCE_MS
+  }
+
+  private modelHeaderEnabled(rt: Runtime): boolean {
+    return this.cfg.bots.find((b) => b.name === rt.name)?.modelHeader ?? true
   }
 
   private async handleCommand(rt: Runtime, msg: InboundMessage): Promise<void> {
     const [cmd, ...rest] = msg.text.trim().slice(1).split(/\s+/)
     const arg = rest.join(" ").trim()
-    this.clearAck(rt)
     const reply = (t: string) => rt.feishu.sendText(msg.chatId, t)
     log("bridge", `command /${cmd} ${arg}`)
     try {
@@ -635,6 +777,33 @@ export class Bridge {
           const old = this.switchSession(rt, target)
           this.armAutoWatch(rt)
           await reply(`已切换会话\n${target}\n(旧 ${old})`)
+          break
+        }
+        case "models":
+        case "model": {
+          const current = await sessionModel(this.client, rt.sessionId, rt.directory)
+          const list = buildModelList(this.cfg.models, current)
+          if (list.length === 0) {
+            await reply("没有可切换的模型（在 config.models 配置 providerID/modelID）")
+            break
+          }
+          if (!arg) {
+            const catalog = await providerCatalog(this.client, rt.directory)
+            await reply(renderModelList(list, current, rt.pendingModel, catalog))
+            break
+          }
+          if (!/^\d+$/.test(arg)) {
+            await reply("用法: /models 或 /models <编号>")
+            break
+          }
+          const n = Number(arg)
+          if (n < 1 || n > list.length) {
+            await reply(`编号 ${arg} 超出范围（共 ${list.length} 个），发 /models 查看`)
+            break
+          }
+          rt.pendingModel = list[n - 1]
+          log("bridge", `model switch ${rt.name} -> ${modelKey(rt.pendingModel)}`)
+          await reply(`已切到 ${modelKey(rt.pendingModel)}，其后消息（含排队中）立即生效`)
           break
         }
         case "compact":
@@ -735,43 +904,13 @@ export class Bridge {
         case "help":
         default:
           await reply(
-            "命令:\n/new 新会话\n/sessions 列会话\n/pin <编号> 切换会话\n/compact 压缩上下文\n/timers 列 timer\n/timer <分钟后> <标题> 设 timer\n/cancel <id> 取消 timer\n/pending 列待审批\n/allow <id> 放行审批\n/deny <id> 拒绝审批\n/retry <id> 重新发起审批\n/help 帮助",
+            "命令:\n/new 新会话\n/sessions 列会话\n/pin <编号> 切换会话\n/models 列模型\n/models <编号> 切换模型\n/compact 压缩上下文\n/timers 列 timer\n/timer <分钟后> <标题> 设 timer\n/cancel <id> 取消 timer\n/pending 列待审批\n/allow <id> 放行审批\n/deny <id> 拒绝审批\n/retry <id> 重新发起审批\n/help 帮助",
           )
           break
       }
     } catch (err) {
       warn("bridge", `command /${cmd} failed: ${String(err)}`)
       await reply(`命令 /${cmd} 执行失败: ${String(err).slice(0, 120)}`)
-    }
-  }
-
-  /** Inject now or queue behind the current turn. Returns true when the message was queued. */
-  private submit(rt: Runtime, item: Inbound): boolean {
-    if (!rt.busy && !rt.inflight && rt.queue.size === 0) {
-      void this.inject(rt, item)
-      return false
-    }
-    rt.queue.dropExpired()
-    rt.queue.push(item)
-    log("bridge", `queued for ${rt.name} (size=${rt.queue.size})`)
-    return true
-  }
-
-  private async inject(rt: Runtime, item: Inbound): Promise<void> {
-    const injectedId = `msg_feishu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
-    rt.inflight = { injectedId, chatId: item.chatId, since: Date.now() }
-    rt.busy = true
-    try {
-      const actualId = await this.deliver(rt.sessionId, rt.directory, injectedId, item.text)
-      if (rt.inflight) rt.inflight.injectedId = actualId
-      log("bridge", `injected ${actualId} -> ${rt.sessionId}`)
-    } catch (err) {
-      warn("bridge", `inject failed: ${String(err)}`)
-      rt.busy = false
-      rt.inflight = undefined
-      this.clearAck(rt)
-      // Never leave the sender guessing when delivery itself fails.
-      void rt.feishu.sendText(item.chatId, "[系统] 消息处理失败，请重试。")
     }
   }
 
@@ -844,11 +983,14 @@ export class Bridge {
           rt.pendingHandoff = undefined
           await this.autoHandoff(rt, p.tokens)
         }
-        rt.queue.dropExpired()
-        const next = rt.queue.shift()
-        if (next) {
-          await this.inject(rt, next)
-          return
+        for (const chat of rt.chats.values()) chat.queue.dropExpired()
+        // Drain the next ready batch (quiet already reached) at this turn boundary.
+        if (this.canStartTurn(rt)) {
+          const next = this.nextReadyChat(rt)
+          if (next) {
+            await this.drainChat(rt, next)
+            return
+          }
         }
       } finally {
         rt.resolving = false
@@ -880,12 +1022,14 @@ export class Bridge {
             }
           }
           const body = texts.join("\n\n").trim()
-          this.clearAck(rt)
-          if (body) await rt.feishu.sendText(inflight.chatId, body)
+          const info = last.info as { providerID?: string; modelID?: string }
+          const model = info.providerID && info.modelID ? { providerID: info.providerID, modelID: info.modelID } : undefined
+          const header = this.modelHeaderEnabled(rt) ? formatModelHeader(model) : ""
+          if (body) await rt.feishu.sendText(inflight.chatId, header + body)
           for (const url of files) await this.sendFilePart(rt, inflight.chatId, url)
           // Never leave the sender with silence: a completed turn with no text/files still reports.
-          if (!body && files.length === 0) await rt.feishu.sendText(inflight.chatId, "[已处理完成，无文字回复]")
-          log("bridge", `reply -> chat=${inflight.chatId} chars=${body.length} files=${files.length}`)
+          if (!body && files.length === 0) await rt.feishu.sendText(inflight.chatId, header + "[已处理完成，无文字回复]")
+          log("bridge", `reply -> chat=${inflight.chatId} model=${model ? modelKey(model) : "-"} chars=${body.length} files=${files.length}`)
           return true
         }
       } catch (err) {
@@ -1002,15 +1146,15 @@ export class Bridge {
     return c
   }
 
-  private async promptWake(sessionId: string, directory: string, messageID: string, text: string, serverUrl?: string): Promise<void> {
+  private async promptWake(sessionId: string, directory: string, messageID: string, text: string, serverUrl?: string, model?: Model): Promise<void> {
     const client = this.clientFor(serverUrl)
     try {
-      // No explicit model: use the session's own model, so the bridge never pins a stale model id.
-      await promptAsync(client, sessionId, directory, undefined, messageID, text)
+      // No explicit model keeps the session's own model, so the bridge never pins a stale model id.
+      await promptAsync(client, sessionId, directory, model, messageID, text)
     } catch (err) {
       if (client === this.client) throw err
       warn("bridge", `wake via ${serverUrl} failed, retry via daemon: ${String(err)}`)
-      await promptAsync(this.client, sessionId, directory, undefined, messageID, text)
+      await promptAsync(this.client, sessionId, directory, model, messageID, text)
     }
   }
 
@@ -1019,8 +1163,8 @@ export class Bridge {
    * Session-scoped only: `prompt_async` targets one sessionID and is headless-safe. The TUI channel
    * (`/tui/*`) is global broadcast and must not be used for wakes.
    */
-  private async deliver(sessionId: string, directory: string, messageID: string, text: string, serverUrl?: string): Promise<string> {
-    await this.promptWake(sessionId, directory, messageID, text, serverUrl)
+  private async deliver(sessionId: string, directory: string, messageID: string, text: string, serverUrl?: string, model?: Model): Promise<string> {
+    await this.promptWake(sessionId, directory, messageID, text, serverUrl, model)
     return messageID
   }
 
@@ -1120,7 +1264,7 @@ export class Bridge {
     try {
       const rt = this.runtimes.get(sessionId)
       if (rt) {
-        if (rt.resolving || rt.busy || rt.inflight || rt.queue.size > 0) return
+        if (rt.resolving || rt.busy || rt.inflight || this.hasPending(rt)) return
       } else if (await this.sessionBusy(sessionId, entry.directory)) {
         return
       }
@@ -1322,7 +1466,7 @@ export class Bridge {
       this.contextWatches.cancel(w.id)
       return
     }
-    if (rt.busy || rt.resolving || rt.inflight || rt.queue.size > 0) {
+    if (rt.busy || rt.resolving || rt.inflight || this.hasPending(rt)) {
       rt.pendingHandoff = { tokens }
       log("handoff", `auto hand-off deferred until idle for ${rt.name} at ${k}k`)
       return
@@ -1345,7 +1489,7 @@ export class Bridge {
     const message = renderHandoffMessage(ah.message, { oldSession: old, tokens: k, directory: rt.directory, title })
     log("handoff", `auto hand-off ${rt.name} ${old} at ${k}k -> new session`)
     try {
-      const model = await sessionModel(this.client, old, rt.directory)
+      const model = rt.pendingModel ?? (await sessionModel(this.client, old, rt.directory))
       const r = await startHandoff(this.client, {
         title,
         message,

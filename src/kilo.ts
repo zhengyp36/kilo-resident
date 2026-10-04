@@ -6,6 +6,15 @@ import { warn } from "./log.ts"
 export type Model = { providerID: string; modelID: string }
 export type SessionMessage = { info: Message; parts: Part[] }
 
+export interface ProviderCatalog {
+  /** "providerID/modelID" -> human-readable model name. */
+  labels: Map<string, string>
+  /** Provider ids that are currently connected/authenticated. */
+  connected: Set<string>
+  /** True when the provider read succeeded; when false, availability is unknown (do not flag). */
+  available: boolean
+}
+
 export function makeKiloClient(d: DaemonInfo): KiloClient {
   const auth = d.username
     ? { Authorization: `Basic ${Buffer.from(`${d.username}:${d.password ?? ""}`).toString("base64")}` }
@@ -66,6 +75,27 @@ export function parseModel(spec: string): Model | undefined {
   const i = s.indexOf("/")
   if (i <= 0 || i >= s.length - 1) return undefined
   return { providerID: s.slice(0, i), modelID: s.slice(i + 1) }
+}
+
+/**
+ * Best-effort catalog of provider models for /models labels and availability. Returns an empty
+ * catalog (labels lookups fall back to the raw id) on any failure rather than throwing.
+ */
+export async function providerCatalog(client: KiloClient, directory: string): Promise<ProviderCatalog> {
+  const labels = new Map<string, string>()
+  const connected = new Set<string>()
+  try {
+    const r = await client.provider.list({ query: { directory } })
+    const data = r.data
+    for (const id of data?.connected ?? []) connected.add(id)
+    for (const p of data?.all ?? []) {
+      for (const m of Object.values(p.models ?? {})) labels.set(`${p.id}/${m.id}`, m.name)
+    }
+    return { labels, connected, available: true }
+  } catch (err) {
+    warn("kilo", `provider catalog read failed: ${String(err)}`)
+    return { labels, connected, available: false }
+  }
 }
 
 /**

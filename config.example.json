@@ -1,5 +1,13 @@
 {
   "model": { "providerID": "deepseek", "modelID": "deepseek-flash" },
+  "models": [
+    "deepseek/deepseek-flash",
+    "deepseek/deepseek-v4-pro",
+    "moonshotai-cn/kimi-k2.7-code",
+    "moonshotai-cn/kimi-k2.6",
+    "moonshotai-cn/kimi-k2.7-code-highspeed",
+    "moonshotai-cn/kimi-k3"
+  ],
   "daemon": { "url": "", "username": "", "password": "" },
   "accounts": [
     { "user_id": "<feishu-user-id>", "name": "YZ", "trust": "superuser" }
@@ -23,7 +31,7 @@
       }
     }
   ],
-  "queue": { "maxWaitMs": 900000 },
+  "queue": { "maxWaitMs": 900000, "coalesceMs": 700 },
   "timers": { "maxActive": 20, "minIntervalSec": 10 },
   "contextWatch": { "maxActive": 10, "intervalSec": 60, "minIntervalSec": 15 },
   "terminal": { "maxOutput": 262144, "defaultObserveLimit": 8192 },

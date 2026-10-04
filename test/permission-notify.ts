@@ -2,7 +2,6 @@
 // approval notice to the bot's configured notifyChat instead of a lastChatId.
 import { mkdirSync } from "node:fs"
 import { Bridge } from "../src/bridge.ts"
-import { SessionQueue } from "../src/queue.ts"
 
 const DIR = "/tmp/kilo/perm-notify"
 mkdirSync(DIR, { recursive: true })
@@ -32,7 +31,7 @@ const botRt: any = {
   sessionId: "ses-notify",
   feishu: { sendText: async (chatId: string, text: string) => void sent.push({ chatId, text }) },
   busy: false,
-  queue: new SessionQueue(600_000, () => {}),
+  chats: new Map(),
   wakes: [],
   // lastChatId intentionally absent: the human has not DM'd this bot.
 }
